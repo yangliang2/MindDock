@@ -22,6 +22,23 @@ public struct DropPrepAnalysis: Sendable, Equatable {
     }
 }
 
+public enum IntelligenceConnectionError: Error, LocalizedError, Sendable, Equatable {
+    case missingAPIKey
+    case httpStatus(Int, String)
+    case emptyResponse
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingAPIKey:
+            return "API Key is empty. Enter an OpenAI-compatible API Key first."
+        case .httpStatus(let status, let detail):
+            return detail.isEmpty ? "HTTP \(status)" : "HTTP \(status): \(detail)"
+        case .emptyResponse:
+            return "Endpoint returned an empty completion response."
+        }
+    }
+}
+
 public protocol IntelligenceClient: Sendable {
     func prepareDrop(raw: String, explicitLane: Lane?) async -> DropPrepAnalysis
     func rankRecall(query: String, candidates: [DockItem]) async -> [DockItem]
@@ -132,6 +149,21 @@ public final class OpenAICompatibleIntelligenceClient: IntelligenceClient, @unch
     ) {
         self.configuration = configuration
         self.urlSession = urlSession
+    }
+
+    public func testConnection() async throws -> String {
+        guard configuration.isConfigured else {
+            throw IntelligenceConnectionError.missingAPIKey
+        }
+        let reply = try await sendChatCompletion(
+            system: "Reply briefly with OK.",
+            user: "ping"
+        )
+        let cleaned = reply
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let preview = String(cleaned.prefix(40))
+        return "Connected (\(configuration.model)): \(preview)"
     }
 
     public func prepareDrop(raw: String, explicitLane: Lane?) async -> DropPrepAnalysis {
@@ -315,12 +347,17 @@ public final class OpenAICompatibleIntelligenceClient: IntelligenceClient, @unch
         request.httpBody = try JSONEncoder().encode(payload)
 
         let (data, response) = try await urlSession.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+        guard let http = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let bodyText = String(decoding: data, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            throw IntelligenceConnectionError.httpStatus(http.statusCode, String(bodyText.prefix(240)))
         }
         let decoded = try JSONDecoder().decode(ChatCompletionResponseDTO.self, from: data)
         guard let content = decoded.choices.first?.message.content, !content.isEmpty else {
-            throw URLError(.cannotParseResponse)
+            throw IntelligenceConnectionError.emptyResponse
         }
         return content
     }

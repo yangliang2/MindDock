@@ -112,12 +112,38 @@ public struct ShiftSyncResult: Sendable, Equatable {
     }
 }
 
-public enum MobileBridgeError: Error, Sendable, Equatable {
+public struct MobilePushTestResult: Sendable, Equatable {
+    public let pushedBerthCount: Int
+    public let usedSamplePreview: Bool
+
+    public init(pushedBerthCount: Int, usedSamplePreview: Bool) {
+        self.pushedBerthCount = pushedBerthCount
+        self.usedSamplePreview = usedSamplePreview
+    }
+}
+
+public enum MobileBridgeError: Error, LocalizedError, Sendable, Equatable {
     case unconfigured
     case invalidResponse(String)
     case httpStatus(Int, String)
     case remoteError(Int, String)
     case transcriptionFailed(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unconfigured:
+            return "Mobile bridge is not configured yet. Enter a Feishu App ID + Secret (with Chat ID) or a Webhook URL."
+        case .invalidResponse(let detail):
+            return "Invalid response from mobile bridge: \(detail)"
+        case .httpStatus(let status, let body):
+            let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? "HTTP \(status)" : "HTTP \(status): \(String(trimmed.prefix(200)))"
+        case .remoteError(let code, let msg):
+            return "Remote error (\(code)): \(msg)"
+        case .transcriptionFailed(let msg):
+            return "Audio transcription failed: \(msg)"
+        }
+    }
 }
 
 public struct MobileBridgeConfig: Codable, Sendable, Equatable {
@@ -220,6 +246,11 @@ public final class FeishuMobileBridgeClient: MobileBridgeClient, @unchecked Send
             if let receiveId = try await resolveTargetChatId(token: token) {
                 try await sendAppBotCard(payload: payload, receiveId: receiveId, token: token)
                 return
+            }
+            if config.webhookURL == nil {
+                throw MobileBridgeError.invalidResponse(
+                    "Feishu App credentials verified, but no bot chat found yet. Send 'hi' to your MindDock bot in Feishu (or fill in Chat ID)."
+                )
             }
         }
 

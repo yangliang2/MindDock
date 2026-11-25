@@ -33,6 +33,7 @@ public enum QuickBarMode: String, CaseIterable, Sendable {
 final class DockViewModel: ObservableObject {
     let engine: DockEngine
     let voiceController: VoiceCaptureController
+    let settingsStore: MindDockSettingsStore
 
     @Published private(set) var snapshot: DockSnapshot
     @Published var statusBanner: String?
@@ -49,9 +50,11 @@ final class DockViewModel: ObservableObject {
 
     init(
         engine: DockEngine,
-        voiceController: VoiceCaptureController? = nil
+        voiceController: VoiceCaptureController? = nil,
+        settingsStore: MindDockSettingsStore = MindDockSettingsStore()
     ) throws {
         self.engine = engine
+        self.settingsStore = settingsStore
         self.voiceController = voiceController ?? VoiceCaptureController(
             intelligenceClient: engine.intelligenceClient,
             hasASRFallbackEndpoint: (engine.intelligenceClient as? OpenAICompatibleIntelligenceClient)?.configuration.asrEndpointURL != nil
@@ -231,28 +234,67 @@ final class DockViewModel: ObservableObject {
         shift(to: .work)
     }
 
+    func applySettings(_ settings: MindDockSettings) {
+        let llmConfig = settings.openAIConfiguration
+        let intelligence = OpenAICompatibleIntelligenceClient(configuration: llmConfig)
+        let transcriber = MacOSAudioTranscriber()
+        let bridge: (any MobileBridgeClient)? = settings.mobileBridgeConfig.map {
+            FeishuMobileBridgeClient(config: $0, audioTranscriber: transcriber)
+        }
+        engine.setIntelligenceClient(intelligence)
+        engine.setMobileBridge(bridge)
+        voiceController.updateIntelligenceClient(
+            intelligence,
+            hasASRFallbackEndpoint: llmConfig.asrEndpointURL != nil
+        )
+        statusBanner = "Settings applied live"
+        onStateChanged?()
+    }
+
+    func triggerTestMobilePush() async throws -> MobilePushTestResult {
+        let result = try await engine.testMobilePush()
+        if result.usedSamplePreview {
+            statusBanner = "Sent sample test card to phone lock screen"
+        } else {
+            statusBanner = "Pushed \(result.pushedBerthCount) Life Berth(s) to phone lock screen"
+        }
+        onStateChanged?()
+        return result
+    }
+
+    func triggerManualMobileSync() async throws -> MobileSyncReport {
+        let report = try await engine.syncMobileBridge()
+        if let updated = try? engine.getDock() {
+            snapshot = updated
+        }
+        if !report.droppedItems.isEmpty || !report.resolvedItems.isEmpty {
+            statusBanner = "Synced \(report.droppedItems.count) mobile Drop(s), \(report.resolvedItems.count) resolved"
+        } else {
+            statusBanner = "Mobile bridge up to date"
+        }
+        onStateChanged?()
+        return report
+    }
+
     func syncMobileBridgeInBackground(manual: Bool = false) {
-        let engineRef = self.engine
         Task { [weak self] in
+            guard let self else { return }
             do {
-                let report = try await engineRef.syncMobileBridge()
-                await MainActor.run {
-                    guard let self else { return }
+                if manual {
+                    _ = try await self.triggerManualMobileSync()
+                } else {
+                    let report = try await self.engine.syncMobileBridge()
                     if let updated = try? self.engine.getDock() {
                         self.snapshot = updated
                     }
                     if !report.droppedItems.isEmpty || !report.resolvedItems.isEmpty {
                         self.statusBanner = "Synced \(report.droppedItems.count) mobile Drop(s), \(report.resolvedItems.count) resolved"
-                    } else if manual {
-                        self.statusBanner = "Mobile bridge up to date"
                     }
                     self.onStateChanged?()
                 }
             } catch {
                 if manual {
-                    await MainActor.run {
-                        self?.statusBanner = "Mobile sync failed: \(error)"
-                    }
+                    self.statusBanner = "Mobile sync failed: \(error.localizedDescription)"
                 }
             }
         }

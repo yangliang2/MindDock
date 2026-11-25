@@ -49,6 +49,15 @@ private func runSmokeCheck() async throws {
     try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     defer { try? FileManager.default.removeItem(at: tempDir) }
 
+    let smokeConfigDir = tempDir.appendingPathComponent("config", isDirectory: true)
+    let smokeStore = MindDockSettingsStore(
+        configJSONURL: smokeConfigDir.appendingPathComponent("config.json"),
+        primaryDotEnvURL: smokeConfigDir.appendingPathComponent(".env"),
+        additionalDotEnvURLs: [],
+        environment: [:],
+        defaults: nil
+    )
+
     let engine = try DockEngine(
         databasePath: tempDir.appendingPathComponent("smoke.sqlite3").path,
         intelligenceClient: SmokeIntelligence()
@@ -59,7 +68,7 @@ private func runSmokeCheck() async throws {
         throw DockError.storageFailure("Voice hardware should be idle on launch")
     }
 
-    let vm = try DockViewModel(engine: engine, voiceController: voice)
+    let vm = try DockViewModel(engine: engine, voiceController: voice, settingsStore: smokeStore)
 
     // 1. Toggle on-demand voice capture -> streams speech -> submit releases mic immediately
     vm.toggleVoiceCapture()
@@ -117,7 +126,17 @@ private func runSmokeCheck() async throws {
         throw DockError.storageFailure("SystemShiftMonitor failed to stop cleanly")
     }
 
-    print("MindDockApp smoke check passed (Voice on-demand teardown, Prep ready, Recall & Resurface, SystemShiftMonitor verified)")
+    // 4. Verify SettingsViewModel saves 0600 config & hot-reloads into DockViewModel without restart
+    let settingsVM = SettingsViewModel(store: smokeStore, dockViewModel: vm)
+    settingsVM.draft.llmBaseURL = "https://api.deepseek.com/v1"
+    settingsVM.draft.llmModel = "deepseek-chat"
+    settingsVM.draft.llmAPIKey = "sk-smoke-test-key"
+    guard settingsVM.saveAndApply(),
+          smokeStore.load().llmAPIKey == "sk-smoke-test-key" else {
+        throw DockError.storageFailure("SettingsViewModel failed to persist and hot-reload settings")
+    }
+
+    print("MindDockApp smoke check passed (Voice on-demand teardown, Prep ready, Recall & Resurface, SystemShiftMonitor, Settings hot-reload verified)")
 }
 
 if CommandLine.arguments.contains("--smoke-check") {

@@ -10,21 +10,26 @@ final class FocusTriggerModel: ObservableObject {
 @MainActor
 final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
+    private var settingsStore = MindDockSettingsStore()
     private var viewModel: DockViewModel?
+    private var settingsViewModel: SettingsViewModel?
     private var edgeDockPanel: EdgeDockPanel?
     private var quickDropPanel: QuickDropPanel?
+    private var settingsWindow: SettingsWindow?
     private var shiftMonitor: SystemShiftMonitor?
     private let focusTrigger = FocusTriggerModel()
     private weak var previousExternalApp: NSRunningApplication?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        setupApplicationMainMenu()
 
         do {
-            let llmConfig = OpenAICompatibleConfiguration.fromEnvironmentOrDefaults()
+            let initialSettings = settingsStore.load()
+            let llmConfig = initialSettings.openAIConfiguration
             let intelligence = OpenAICompatibleIntelligenceClient(configuration: llmConfig)
             let transcriber = MacOSAudioTranscriber()
-            let mobileBridge: (any MobileBridgeClient)? = MobileBridgeConfig.fromEnvironment().map {
+            let mobileBridge: (any MobileBridgeClient)? = initialSettings.mobileBridgeConfig.map {
                 FeishuMobileBridgeClient(config: $0, audioTranscriber: transcriber)
             }
             let engine = try DockEngine(
@@ -37,7 +42,11 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
                 intelligenceClient: intelligence,
                 hasASRFallbackEndpoint: llmConfig.asrEndpointURL != nil
             )
-            let vm = try DockViewModel(engine: engine, voiceController: voice)
+            let vm = try DockViewModel(
+                engine: engine,
+                voiceController: voice,
+                settingsStore: settingsStore
+            )
             self.viewModel = vm
 
             setupPanels(with: vm)
@@ -70,6 +79,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
             viewModel: vm,
             onOpenQuickDrop: { [weak self] in self?.showQuickDrop(mode: .drop) },
             onOpenRecall: { [weak self] in self?.showQuickDrop(mode: .recall) },
+            onOpenSettings: { [weak self] in self?.showSettingsWindow() },
             onHideDock: { [weak self] in self?.hideEdgeDock() }
         )
         self.edgeDockPanel = EdgeDockPanel(rootView: edgeView)
@@ -147,7 +157,23 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         syncMobileItem.target = self
         menu.addItem(syncMobileItem)
 
+        let testPushItem = NSMenuItem(
+            title: "Test Lock-Screen Push",
+            action: #selector(handleTestLockScreenPush),
+            keyEquivalent: ""
+        )
+        testPushItem.target = self
+        menu.addItem(testPushItem)
+
         menu.addItem(.separator())
+
+        let settingsItem = NSMenuItem(
+            title: "Settings & Mobile Setup…",
+            action: #selector(handleOpenSettings),
+            keyEquivalent: ","
+        )
+        settingsItem.target = self
+        menu.addItem(settingsItem)
 
         let quitItem = NSMenuItem(
             title: "Quit MindDock",
@@ -251,6 +277,70 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         self.previousExternalApp = nil
     }
 
+    func showSettingsWindow() {
+        guard let vm = viewModel else { return }
+        if settingsWindow == nil {
+            let settingsVM = SettingsViewModel(store: settingsStore, dockViewModel: vm)
+            self.settingsViewModel = settingsVM
+            let rootView = SettingsView(
+                viewModel: settingsVM,
+                onClose: { [weak self] in
+                    self?.settingsWindow?.close()
+                }
+            )
+            self.settingsWindow = SettingsWindow(rootView: rootView)
+        } else {
+            settingsViewModel?.draft = settingsStore.load()
+        }
+        NSApp.activate()
+        settingsWindow?.makeKeyAndOrderFront(nil)
+    }
+
+    private func setupApplicationMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        let settingsItem = NSMenuItem(
+            title: "Settings & Mobile Setup…",
+            action: #selector(handleOpenSettings),
+            keyEquivalent: ","
+        )
+        settingsItem.target = self
+        appMenu.addItem(settingsItem)
+        appMenu.addItem(.separator())
+        let quitItem = NSMenuItem(
+            title: "Quit MindDock",
+            action: #selector(handleQuit),
+            keyEquivalent: "q"
+        )
+        quitItem.target = self
+        appMenu.addItem(quitItem)
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        // Standard Edit menu enables ⌘V / ⌘C / ⌘X / ⌘A / ⌘Z inside accessory-app TextFields & SecureFields
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        let windowMenuItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        windowMenuItem.submenu = windowMenu
+        mainMenu.addItem(windowMenuItem)
+
+        NSApp.mainMenu = mainMenu
+    }
+
     // MARK: - Menu Actions
 
     @objc private func handleQuickDropMenu() {
@@ -277,6 +367,23 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleSyncMobileNow() {
         viewModel?.syncMobileBridgeInBackground(manual: true)
+    }
+
+    @objc private func handleTestLockScreenPush() {
+        guard let vm = viewModel else { return }
+        Task { @MainActor in
+            do {
+                _ = try await vm.triggerTestMobilePush()
+                self.showEdgeDock()
+            } catch {
+                vm.statusBanner = "Test push failed: \(error.localizedDescription)"
+                self.showSettingsWindow()
+            }
+        }
+    }
+
+    @objc private func handleOpenSettings() {
+        showSettingsWindow()
     }
 
     @objc private func handleQuit() {

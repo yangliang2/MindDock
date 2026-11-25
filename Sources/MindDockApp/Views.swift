@@ -5,6 +5,7 @@ struct EdgeDockView: View {
     @ObservedObject var viewModel: DockViewModel
     let onOpenQuickDrop: () -> Void
     let onOpenRecall: () -> Void
+    let onOpenSettings: () -> Void
     let onHideDock: () -> Void
 
     private var accentColor: Color {
@@ -70,6 +71,15 @@ struct EdgeDockView: View {
                 }
                 .buttonStyle(.plain)
                 .help("Open Quick Drop (Option + Space)")
+
+                Button(action: onOpenSettings) {
+                    Image(systemName: "gearshape")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 20, height: 20)
+                }
+                .buttonStyle(.plain)
+                .help("Settings & Mobile Setup (⌘,)")
 
                 Button(action: onHideDock) {
                     Image(systemName: "xmark")

@@ -201,8 +201,8 @@ final class VoiceCaptureController: ObservableObject {
     @Published private(set) var voiceStatusMessage: String?
 
     private let driver: any VoiceCaptureSessionDriver
-    private let intelligenceClient: (any IntelligenceClient)?
-    private let hasASRFallbackEndpoint: Bool
+    private var intelligenceClient: (any IntelligenceClient)?
+    private var hasASRFallbackEndpoint: Bool
     private var basePrefix: String = ""
     private var latestSessionTranscript: String = ""
     private var onTextUpdated: ((String) -> Void)?
@@ -214,6 +214,14 @@ final class VoiceCaptureController: ObservableObject {
     ) {
         self.driver = driver
         self.intelligenceClient = intelligenceClient
+        self.hasASRFallbackEndpoint = hasASRFallbackEndpoint
+    }
+
+    func updateIntelligenceClient(
+        _ client: (any IntelligenceClient)?,
+        hasASRFallbackEndpoint: Bool
+    ) {
+        self.intelligenceClient = client
         self.hasASRFallbackEndpoint = hasASRFallbackEndpoint
     }
 

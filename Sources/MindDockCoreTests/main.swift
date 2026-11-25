@@ -1504,6 +1504,212 @@ let allTests: [TestCase] = [
                 try expectEqual(resolved.promotedItem?.id, deep1.id)
             }
         }
+    },
+    TestCase(name: "settings_store_persists_0600_config_syncs_wizard_dotenv_and_redacts_secrets") {
+        let tempRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MindDockSettingsTests-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempRoot) }
+
+        let configDir = tempRoot.appendingPathComponent("minddock-config", isDirectory: true)
+        let configJSONURL = configDir.appendingPathComponent("config.json")
+        let dotEnvURL = configDir.appendingPathComponent(".env")
+
+        // 1. Simulate CLI setup-wizard.sh writing ~/.config/minddock/.env first
+        try FileManager.default.createDirectory(at: configDir, withIntermediateDirectories: true)
+        let wizardDotEnv = """
+        MINDDOCK_LLM_BASE_URL='https://api.openai.com/v1'
+        MINDDOCK_LLM_API_KEY='sk-wizard-initial-secret'
+        MINDDOCK_LLM_MODEL='gpt-4o-mini'
+        MINDDOCK_ASR_URL='https://api.openai.com/v1/audio/transcriptions'
+        MINDDOCK_FEISHU_APP_ID='cli_wiz_app_01'
+        MINDDOCK_FEISHU_APP_SECRET='sec_wiz_secret_01'
+        MINDDOCK_FEISHU_CHAT_ID='oc_wiz_chat_01'
+        """
+        try Data(wizardDotEnv.utf8).write(to: dotEnvURL)
+
+        let storeFromWizard = MindDockSettingsStore(
+            configJSONURL: configJSONURL,
+            primaryDotEnvURL: dotEnvURL,
+            additionalDotEnvURLs: [],
+            environment: [:],
+            defaults: nil
+        )
+        let loadedFromWizard = storeFromWizard.load()
+        try expectEqual(loadedFromWizard.llmBaseURL, "https://api.openai.com/v1")
+        try expectEqual(loadedFromWizard.llmAPIKey, "sk-wizard-initial-secret")
+        try expectEqual(loadedFromWizard.llmModel, "gpt-4o-mini")
+        try expectEqual(loadedFromWizard.asrEndpointURL, "https://api.openai.com/v1/audio/transcriptions")
+        try expectEqual(loadedFromWizard.feishuAppId, "cli_wiz_app_01")
+        try expectEqual(loadedFromWizard.feishuAppSecret, "sec_wiz_secret_01")
+        try expectEqual(loadedFromWizard.feishuChatId, "oc_wiz_chat_01")
+        try expectEqual(loadedFromWizard.openAIConfiguration.isConfigured, true)
+        try expectEqual(loadedFromWizard.mobileBridgeConfig?.hasAppBotCredentials, true)
+
+        // 2. Save updated settings from in-app Settings UI (including single quote in secret)
+        var updated = loadedFromWizard
+        updated.llmBaseURL = "https://api.deepseek.com/v1"
+        updated.llmAPIKey = "sk-live-it's-super-secret-999"
+        updated.llmModel = "deepseek-chat"
+        updated.feishuAppSecret = "sec-app-secret-888"
+        updated.feishuWebhookURL = "https://open.feishu.cn/open-apis/bot/v2/hook/secret-hook-token-777"
+        try storeFromWizard.save(updated)
+
+        // Verify 0600 file permissions on both config.json and .env
+        let jsonAttrs = try FileManager.default.attributesOfItem(atPath: configJSONURL.path)
+        let envAttrs = try FileManager.default.attributesOfItem(atPath: dotEnvURL.path)
+        let jsonMode = (jsonAttrs[.posixPermissions] as? Int ?? 0) & 0o777
+        let envMode = (envAttrs[.posixPermissions] as? Int ?? 0) & 0o777
+        try expectEqual(jsonMode, 0o600, "config.json must have 0600 permissions")
+        try expectEqual(envMode, 0o600, ".env must have 0600 permissions")
+
+        // Verify round-trip load and two-way .env compatibility with template.sh single-quote escaping
+        let reloaded = storeFromWizard.load()
+        try expectEqual(reloaded, updated)
+        let dotEnvContent = try String(contentsOf: dotEnvURL, encoding: .utf8)
+        try expectTrue(
+            dotEnvContent.contains("MINDDOCK_LLM_API_KEY='sk-live-it'\\''s-super-secret-999'"),
+            ".env must escape single quotes compatibly with setup-wizard.sh _existing()"
+        )
+
+        // Verify environment variable override precedence
+        let envOverrideStore = MindDockSettingsStore(
+            configJSONURL: configJSONURL,
+            primaryDotEnvURL: dotEnvURL,
+            additionalDotEnvURLs: [],
+            environment: ["MINDDOCK_LLM_MODEL": "deepseek-reasoner"],
+            defaults: nil
+        )
+        try expectEqual(envOverrideStore.load().llmModel, "deepseek-reasoner")
+        try expectEqual(envOverrideStore.load().llmAPIKey, "sk-live-it's-super-secret-999")
+
+        // Verify secrets are NEVER leaked in descriptions or redactedSummary
+        let desc = String(describing: reloaded)
+        let debugDesc = String(reflecting: reloaded)
+        let summary = reloaded.redactedSummary
+        for text in [desc, debugDesc, summary] {
+            try expectTrue(!text.contains("sk-live-it's-super-secret-999"), "API key must never appear in description/logs")
+            try expectTrue(!text.contains("sec-app-secret-888"), "Feishu App Secret must never appear in description/logs")
+            try expectTrue(!text.contains("secret-hook-token-777"), "Webhook token must never appear in description/logs")
+        }
+    },
+    TestCase(name: "dock_engine_hot_reloads_intelligence_client_and_verifies_llm_connection") {
+        try runAsyncTest {
+            try await withTempDatabasePathAsync { dbPath in
+                // 1. Unconfigured client rejects testConnection() cleanly and skips Prep
+                let unconfigured = OpenAICompatibleIntelligenceClient(configuration: .unconfigured)
+                var caughtMissingKey = false
+                do {
+                    _ = try await unconfigured.testConnection()
+                } catch IntelligenceConnectionError.missingAPIKey {
+                    caughtMissingKey = true
+                }
+                try expectTrue(caughtMissingKey, "Unconfigured LLM client must throw IntelligenceConnectionError.missingAPIKey")
+
+                let engine = try DockEngine(databasePath: dbPath, intelligenceClient: unconfigured)
+                let firstDrop = try engine.drop("Order H13 HEPA filter before guests arrive")
+                let firstPrepared = try await engine.awaitPrep(id: firstDrop.id)
+                try expectEqual(firstPrepared.prepState, .skipped)
+                try expectEqual(firstPrepared.prep, nil)
+
+                // 2. Bad API key surfaces actionable HTTP 401 error on testConnection()
+                let unauthorizedSession = makeOpenAIMockURLSession { req in
+                    let resp = HTTPURLResponse(url: req.url!, statusCode: 401, httpVersion: nil, headerFields: nil)!
+                    return (resp, Data(#"{"error":{"message":"Invalid authentication token"}}"#.utf8))
+                }
+                let badKeyClient = OpenAICompatibleIntelligenceClient(
+                    configuration: OpenAICompatibleConfiguration(
+                        baseURL: URL(string: "https://api.deepseek.com/v1")!,
+                        apiKey: "sk-bad-key",
+                        model: "deepseek-chat"
+                    ),
+                    urlSession: unauthorizedSession
+                )
+                var caught401 = false
+                do {
+                    _ = try await badKeyClient.testConnection()
+                } catch let IntelligenceConnectionError.httpStatus(code, detail) {
+                    caught401 = (code == 401 && detail.contains("Invalid authentication token"))
+                }
+                try expectTrue(caught401, "HTTP 401 must surface status code and error message")
+
+                // 3. Hot-reload valid OpenAI-compatible client into live DockEngine without restart
+                let liveSession = makeOpenAIMockURLSession { req in
+                    let bodyText = String(decoding: readURLRequestBody(req), as: UTF8.self)
+                    let content: String
+                    if bodyText.contains("ping") {
+                        content = "OK"
+                    } else {
+                        content = #"{"lane":"life","prep":"1. Check filter dimensions\n2. Order H13 two-pack"}"#
+                    }
+                    let json = """
+                    {"choices":[{"message":{"role":"assistant","content":\(String(decoding: try JSONEncoder().encode(content), as: UTF8.self))}}]}
+                    """
+                    let resp = HTTPURLResponse(url: req.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                    return (resp, Data(json.utf8))
+                }
+                let liveClient = OpenAICompatibleIntelligenceClient(
+                    configuration: OpenAICompatibleConfiguration(
+                        baseURL: URL(string: "https://api.deepseek.com/v1")!,
+                        apiKey: "sk-valid-hot-reload",
+                        model: "deepseek-chat"
+                    ),
+                    urlSession: liveSession
+                )
+
+                let probeSummary = try await liveClient.testConnection()
+                try expectTrue(probeSummary.contains("deepseek-chat"), "Connection summary should confirm active model")
+
+                engine.setIntelligenceClient(liveClient)
+
+                let secondDrop = try engine.drop("Replace purifier filter before Sunday")
+                let secondPrepared = try await engine.awaitPrep(id: secondDrop.id)
+                try expectEqual(secondPrepared.lane, .life, "Hot-reloaded LLM client must classify new Drops immediately")
+                try expectEqual(secondPrepared.prepState, .ready)
+                try expectTrue((secondPrepared.prep ?? "").contains("Order H13 two-pack"), "Hot-reloaded LLM client must attach Prep")
+            }
+        }
+    },
+    TestCase(name: "test_mobile_push_sends_preview_when_empty_and_forces_live_push_when_deduplicated") {
+        try runAsyncTest {
+            try await withTempDatabasePathAsync { dbPath in
+                let engine = try DockEngine(databasePath: dbPath)
+
+                // 1. Unconfigured mobileBridge throws MobileBridgeError.unconfigured
+                var caughtUnconfigured = false
+                do {
+                    _ = try await engine.testMobilePush()
+                } catch MobileBridgeError.unconfigured {
+                    caughtUnconfigured = true
+                }
+                try expectTrue(caughtUnconfigured, "testMobilePush must throw MobileBridgeError.unconfigured when nil")
+
+                // 2. Hot-reload FakeMobileBridgeClient; empty Life Dock sends sample preview without mutating SQLite
+                let bridge = FakeMobileBridgeClient()
+                engine.setMobileBridge(bridge)
+
+                let previewResult = try await engine.testMobilePush()
+                try expectEqual(previewResult.usedSamplePreview, true)
+                try expectEqual(previewResult.pushedBerthCount, 1)
+                try expectEqual(bridge.pushedPayloads.count, 1)
+                try expectEqual(try engine.getDock(lane: .life).berths.count, 0, "Preview push must not insert fake items into SQLite")
+
+                // 3. Add real Life Berth, push once via shiftAndSync (deduplicated on repeat), then force live push via testMobilePush
+                let realLife = try engine.drop("下班去丰巢取冷链快递", lane: .life)
+                _ = try engine.attachPrep(id: realLife.id, prep: "取件码 9012")
+                let firstShift = try await engine.shiftAndSync(to: .life)
+                let duplicateShift = try await engine.shiftAndSync(to: .life)
+                try expectEqual(firstShift.pushedLifeDock, true)
+                try expectEqual(duplicateShift.pushedLifeDock, false)
+                try expectEqual(bridge.pushedPayloads.count, 2)
+
+                let forcedResult = try await engine.testMobilePush()
+                try expectEqual(forcedResult.usedSamplePreview, false)
+                try expectEqual(forcedResult.pushedBerthCount, 1)
+                try expectEqual(bridge.pushedPayloads.count, 3, "testMobilePush must force push even when Life Dock was already deduplicated")
+                try expectEqual(bridge.pushedPayloads[2].berths.first?.raw, "下班去丰巢取冷链快递")
+                try expectEqual(bridge.pushedPayloads[2].berths.first?.prep, "取件码 9012")
+            }
+        }
     }
 ]
 

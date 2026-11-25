@@ -22,11 +22,17 @@ public final class DockEngine: @unchecked Sendable {
     private let lock = NSLock()
     private var db: OpaquePointer?
     private var currentActiveLane: Lane = .work
-    public let intelligenceClient: any IntelligenceClient
+    private var currentIntelligenceClient: any IntelligenceClient
     private var mobileBridge: (any MobileBridgeClient)?
     private var audioTranscriber: (any AudioTranscriber)?
     private var prepTasks: [String: Task<DockItem?, Never>] = [:]
     private var dockChangedCallback: (@Sendable () -> Void)?
+
+    public var intelligenceClient: any IntelligenceClient {
+        lock.withLock {
+            currentIntelligenceClient
+        }
+    }
 
     public var onDockChanged: (@Sendable () -> Void)? {
         get {
@@ -47,7 +53,7 @@ public final class DockEngine: @unchecked Sendable {
         mobileBridge: (any MobileBridgeClient)? = nil,
         audioTranscriber: (any AudioTranscriber)? = nil
     ) throws {
-        self.intelligenceClient = intelligenceClient
+        self.currentIntelligenceClient = intelligenceClient
         self.mobileBridge = mobileBridge
         self.audioTranscriber = audioTranscriber
         if databasePath != ":memory:" {
@@ -120,6 +126,12 @@ public final class DockEngine: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return currentActiveLane
+    }
+
+    public func setIntelligenceClient(_ client: any IntelligenceClient) {
+        lock.withLock {
+            self.currentIntelligenceClient = client
+        }
     }
 
     public func setMobileBridge(_ bridge: (any MobileBridgeClient)?) {
@@ -270,6 +282,54 @@ public final class DockEngine: @unchecked Sendable {
 
     private static let lastLifePushFingerprintMetaKey = "last_life_push_fingerprint"
     private static let feishuSyncCursorMetaKey = "feishu_sync_cursor"
+
+    @discardableResult
+    public func testMobilePush() async throws -> MobilePushTestResult {
+        let bridge = lock.withLock { self.mobileBridge }
+        guard let bridge else {
+            throw MobileBridgeError.unconfigured
+        }
+
+        let lifeSnap = try getDock(lane: .life)
+        if lifeSnap.berths.isEmpty {
+            let previewPayload = LifeDockPushPayload(
+                berths: [
+                    LifeDockPushBerth(
+                        slotNumber: 1,
+                        id: "test-preview",
+                        raw: "MindDock 锁屏推送连接测试成功",
+                        prep: "当你锁屏或合盖离开工位时，生活泊位会自动推送到这里；随时发语音或文字即可闪投"
+                    )
+                ],
+                queuedCount: 0,
+                fingerprint: "test-preview-\(UUID().uuidString)"
+            )
+            try await bridge.pushLifeDock(previewPayload)
+            return MobilePushTestResult(pushedBerthCount: 1, usedSamplePreview: true)
+        }
+
+        let berths = lifeSnap.berths.prefix(Self.maxBerths).enumerated().map { index, item in
+            LifeDockPushBerth(
+                slotNumber: index + 1,
+                id: item.id,
+                raw: item.raw,
+                prep: item.prep
+            )
+        }
+        let fingerprint = Self.computeLifePushFingerprint(berths: berths, queuedCount: lifeSnap.queuedCount)
+        let payload = LifeDockPushPayload(
+            berths: berths,
+            queuedCount: lifeSnap.queuedCount,
+            fingerprint: fingerprint
+        )
+        try await bridge.pushLifeDock(payload)
+        try lock.withLock {
+            try inTransaction {
+                try writeMetaUnlocked(key: Self.lastLifePushFingerprintMetaKey, value: fingerprint)
+            }
+        }
+        return MobilePushTestResult(pushedBerthCount: berths.count, usedSamplePreview: false)
+    }
 
     @discardableResult
     public func shiftAndSync(to lane: Lane) async throws -> ShiftSyncResult {
