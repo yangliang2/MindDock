@@ -88,6 +88,59 @@ func runAsyncTest(_ block: @escaping @Sendable () async throws -> Void) throws {
     }
 }
 
+final class OpenAIMockURLProtocol: URLProtocol, @unchecked Sendable {
+    nonisolated(unsafe) static var handler: (@Sendable (URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
+}
+
+func makeOpenAIMockURLSession(
+    handler: @escaping @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)
+) -> URLSession {
+    OpenAIMockURLProtocol.handler = handler
+    let config = URLSessionConfiguration.ephemeral
+    config.protocolClasses = [OpenAIMockURLProtocol.self]
+    return URLSession(configuration: config)
+}
+
+func readURLRequestBody(_ request: URLRequest) -> Data {
+    if let body = request.httpBody { return body }
+    guard let stream = request.httpBodyStream else { return Data() }
+    stream.open()
+    defer { stream.close() }
+    var data = Data()
+    let bufferSize = 4096
+    let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+    defer { buffer.deallocate() }
+    while stream.hasBytesAvailable {
+        let read = stream.read(buffer, maxLength: bufferSize)
+        if read > 0 {
+            data.append(buffer, count: read)
+        } else {
+            break
+        }
+    }
+    return data
+}
+
 final class FakeMobileBridgeClient: MobileBridgeClient, @unchecked Sendable {
     private let lock = NSLock()
     private(set) var pushedPayloads: [LifeDockPushPayload] = []
@@ -1082,6 +1135,373 @@ let allTests: [TestCase] = [
                 let updatedLife = try engine.getDock(lane: .life)
                 try expectEqual(updatedLife.berths.map(\.id).contains(l4.id), true, "Queued l4 promoted after '完成 1'")
                 try expectEqual(updatedLife.berths.map(\.id).contains(l1.id), false, "Resolved l1 sunk to Deep")
+            }
+        }
+    },
+    TestCase(name: "openai_compatible_client_parses_chat_prep_and_lane_for_text_only_provider") {
+        try runAsyncTest {
+            let session = makeOpenAIMockURLSession { request in
+                guard request.url?.absoluteString == "https://api.deepseek.com/v1/chat/completions" else {
+                    throw TestFailure("Unexpected endpoint: \(request.url?.absoluteString ?? "nil")")
+                }
+                guard request.httpMethod == "POST" else {
+                    throw TestFailure("Expected POST, got \(request.httpMethod ?? "nil")")
+                }
+                guard request.value(forHTTPHeaderField: "Authorization") == "Bearer sk-deepseek-test" else {
+                    throw TestFailure("Missing or wrong Authorization header")
+                }
+                let bodyText = String(data: readURLRequestBody(request), encoding: .utf8) ?? ""
+                guard bodyText.contains("deepseek-chat"), bodyText.contains("Order HEPA filter") else {
+                    throw TestFailure("Request body missing model or raw Drop: \(bodyText)")
+                }
+
+                let completionJSON = """
+                {
+                  "choices": [
+                    {
+                      "message": {
+                        "role": "assistant",
+                        "content": "```json\\n{\\"lane\\": \\"life\\", \\"prep\\": \\"1. Check purifier model dimensions\\\\n2. Compare H13 HEPA two-pack\\\\n3. Order for Friday delivery\\\\n4. Extra line that must be trimmed\\"}\\n```"
+                      }
+                    }
+                  ]
+                }
+                """
+                let response = HTTPURLResponse(
+                    url: request.url!,
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                return (response, Data(completionJSON.utf8))
+            }
+
+            let config = OpenAICompatibleConfiguration(
+                baseURL: URL(string: "https://api.deepseek.com/v1")!,
+                apiKey: "sk-deepseek-test",
+                model: "deepseek-chat",
+                asrEndpointURL: nil
+            )
+            let client = OpenAICompatibleIntelligenceClient(configuration: config, urlSession: session)
+
+            let analysis = await client.prepareDrop(raw: "Order HEPA filter before weekend guests arrive", explicitLane: nil)
+            try expectEqual(analysis.lane, .life)
+            try expectEqual(analysis.prepState, .ready)
+            let lines = (analysis.prep ?? "").components(separatedBy: .newlines).filter { !$0.isEmpty }
+            try expectEqual(lines.count, 3, "Prep must be clamped to at most 3 concise lines")
+            try expectEqual(lines.first, "1. Check purifier model dimensions")
+
+            let asrText = await client.transcribeAudio(data: Data([0x00, 0x01]), filename: "voice.m4a", mimeType: "audio/mp4")
+            try expectEqual(asrText, nil)
+        }
+    },
+    TestCase(name: "openai_compatible_client_falls_back_gracefully_offline_and_supports_optional_asr_endpoint") {
+        try runAsyncTest {
+            let offlineSession = makeOpenAIMockURLSession { _ in
+                throw URLError(.notConnectedToInternet)
+            }
+            let offlineClient = OpenAICompatibleIntelligenceClient(
+                configuration: OpenAICompatibleConfiguration(
+                    baseURL: URL(string: "https://api.openai.com/v1")!,
+                    apiKey: "sk-offline-test",
+                    model: "gpt-4o-mini"
+                ),
+                urlSession: offlineSession
+            )
+            let offlineLife = await offlineClient.prepareDrop(raw: "下班去药店买退烧贴", explicitLane: nil)
+            try expectEqual(offlineLife.lane, .life)
+            try expectEqual(offlineLife.prep, nil)
+            try expectEqual(offlineLife.prepState, .skipped)
+
+            let unconfiguredClient = OpenAICompatibleIntelligenceClient(
+                configuration: .unconfigured,
+                urlSession: makeOpenAIMockURLSession { _ in
+                    throw TestFailure("Unconfigured client must not issue network requests")
+                }
+            )
+            let localWork = await unconfiguredClient.prepareDrop(raw: "Investigate SQLite WAL lock contention", explicitLane: nil)
+            try expectEqual(localWork.lane, .work)
+            try expectEqual(localWork.prepState, .skipped)
+
+            let asrSession = makeOpenAIMockURLSession { request in
+                guard request.url?.absoluteString == "https://api.openai.com/v1/audio/transcriptions" else {
+                    throw TestFailure("Unexpected ASR URL: \(request.url?.absoluteString ?? "nil")")
+                }
+                guard request.value(forHTTPHeaderField: "Authorization") == "Bearer sk-asr-key" else {
+                    throw TestFailure("Missing Authorization header on ASR request")
+                }
+                let contentType = request.value(forHTTPHeaderField: "Content-Type") ?? ""
+                guard contentType.contains("multipart/form-data; boundary=") else {
+                    throw TestFailure("Expected multipart/form-data Content-Type, got \(contentType)")
+                }
+                let bodyStr = String(decoding: readURLRequestBody(request), as: UTF8.self)
+                guard bodyStr.contains("whisper-1"), bodyStr.contains("filename=\"drop.m4a\"") else {
+                    throw TestFailure("Multipart body missing model or filename")
+                }
+
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, Data(#"{"text": "下班顺路去丰巢取生鲜快递"}"#.utf8))
+            }
+
+            let asrClient = OpenAICompatibleIntelligenceClient(
+                configuration: OpenAICompatibleConfiguration(
+                    baseURL: URL(string: "https://api.deepseek.com/v1")!,
+                    apiKey: "sk-asr-key",
+                    model: "deepseek-chat",
+                    asrEndpointURL: URL(string: "https://api.openai.com/v1/audio/transcriptions")!,
+                    asrModel: "whisper-1"
+                ),
+                urlSession: asrSession
+            )
+            let transcript = await asrClient.transcribeAudio(
+                data: Data("fake-audio-bytes".utf8),
+                filename: "drop.m4a",
+                mimeType: "audio/mp4"
+            )
+            try expectEqual(transcript, "下班顺路去丰巢取生鲜快递")
+        }
+    },
+    TestCase(name: "drop_asynchronously_attaches_concise_prep_and_smart_lane_triage_without_mutating_sacred_raw") {
+        struct FakePrepIntelligence: IntelligenceClient {
+            let simulatedOffline: Bool
+
+            func prepareDrop(raw: String, explicitLane: Lane?) async -> DropPrepAnalysis {
+                if simulatedOffline {
+                    return DropPrepAnalysis(
+                        lane: explicitLane ?? DockEngine.inferLaneLocally(for: raw),
+                        prep: nil,
+                        prepState: .skipped
+                    )
+                }
+                let smartLane: Lane = raw.contains("HEPA") ? .life : .work
+                let verbosePrep = """
+                1. Check living-room purifier filter code
+                2. Order two-pack before 6pm cutoff
+                3. Swap filter before Sunday
+                4. Fourth line should be clamped by DockEngine
+                """
+                return DropPrepAnalysis(lane: smartLane, prep: verbosePrep, prepState: .ready)
+            }
+        }
+
+        try runAsyncTest {
+            try await withTempDatabasePathAsync { dbPath in
+                let engine = try DockEngine(
+                    databasePath: dbPath,
+                    intelligenceClient: FakePrepIntelligence(simulatedOffline: false)
+                )
+
+                let w1 = try engine.drop("W1: Benchmark query planner", lane: .work)
+                let w2 = try engine.drop("W2: Review API contract", lane: .work)
+                let sacredAmbiguousRaw = "  Order HEPA filter before Sunday guests arrive! [verbatim]  "
+                let autoDrop = try engine.drop(sacredAmbiguousRaw)
+                let wQueued = try engine.drop("W4: Queued work waiting for vacated berth", lane: .work)
+                let explicitOverride = try engine.drop("Audit HEPA cleanroom spec at office", lane: .work)
+
+                let preparedAuto = try await engine.awaitPrep(id: autoDrop.id)
+                try expectEqual(preparedAuto.raw, sacredAmbiguousRaw, "raw text must NEVER be mutated by Prep")
+                try expectEqual(preparedAuto.lane, .life, "AI smart triage should move unpinned errand to Life")
+                try expectEqual(preparedAuto.status, .docked)
+                try expectEqual(preparedAuto.prepState, .ready)
+                let prepLines = (preparedAuto.prep ?? "").components(separatedBy: .newlines)
+                try expectEqual(prepLines.count, 3, "Prep attached to DockItem must have <= 3 lines")
+
+                let preparedOverride = try await engine.awaitPrep(id: explicitOverride.id)
+                try expectEqual(preparedOverride.lane, .work, "Explicit lane override must never be overridden by AI")
+
+                _ = try await engine.awaitPrep(id: w1.id)
+                _ = try await engine.awaitPrep(id: w2.id)
+                _ = try await engine.awaitPrep(id: wQueued.id)
+
+                let workDock = try engine.getDock(lane: .work)
+                try expectEqual(workDock.berths.map(\.id), [w1.id, w2.id, wQueued.id])
+                try expectEqual(workDock.queuedCount, 1)
+
+                let lifeDock = try engine.getDock(lane: .life)
+                try expectEqual(lifeDock.berths.map(\.id), [autoDrop.id])
+                try expectEqual(lifeDock.berths[0].raw, sacredAmbiguousRaw)
+                try expectEqual(lifeDock.berths[0].prepState, .ready)
+
+                let reopened = try DockEngine(databasePath: dbPath)
+                let persistedLife = try reopened.getDock(lane: .life)
+                try expectEqual(persistedLife.berths.first?.prep, preparedAuto.prep)
+                try expectEqual(persistedLife.berths.first?.prepState, .ready)
+                try expectEqual(persistedLife.berths.first?.raw, sacredAmbiguousRaw)
+            }
+
+            try await withTempDatabasePathAsync { dbPath in
+                let offlineEngine = try DockEngine(
+                    databasePath: dbPath,
+                    intelligenceClient: FakePrepIntelligence(simulatedOffline: true)
+                )
+                let raw = "买退烧贴和体温计"
+                let dropped = try offlineEngine.drop(raw)
+                try expectEqual(dropped.lane, .life)
+                let afterFallback = try await offlineEngine.awaitPrep(id: dropped.id)
+                try expectEqual(afterFallback.prepState, .skipped)
+                try expectEqual(afterFallback.prep, nil)
+                try expectEqual(afterFallback.raw, raw)
+            }
+        }
+    },
+    TestCase(name: "openai_compatible_client_ranks_vague_recall_via_llm_and_offline_synonym_fallback") {
+        try runAsyncTest {
+            let candidates = [
+                DockItem(
+                    id: "d1",
+                    raw: "排查支付回调偶发 504 网关报错",
+                    lane: .work,
+                    status: .deep,
+                    prep: "Check upstream Nginx proxy_read_timeout",
+                    prepState: .ready
+                ),
+                DockItem(
+                    id: "d2",
+                    raw: "调研 WebAuthn Passkey 免密方案",
+                    lane: .work,
+                    status: .deep,
+                    prep: "Compare platform authenticator support on macOS/Android",
+                    prepState: .ready
+                ),
+                DockItem(
+                    id: "d3",
+                    raw: "周末给老车办续保手续",
+                    lane: .life,
+                    status: .deep,
+                    prep: nil,
+                    prepState: .skipped
+                )
+            ]
+
+            let onlineSession = makeOpenAIMockURLSession { request in
+                let bodyText = String(decoding: readURLRequestBody(request), as: UTF8.self)
+                guard bodyText.contains("passwordless login idea"),
+                      bodyText.contains("d1"),
+                      bodyText.contains("d2"),
+                      bodyText.contains("d3") else {
+                    throw TestFailure("Recall prompt missing query or candidate IDs: \(bodyText)")
+                }
+
+                let llmPayload = """
+                {
+                  "choices": [
+                    {
+                      "message": {
+                        "role": "assistant",
+                        "content": "{\\"matched_ids\\": [\\"d2\\"]}"
+                      }
+                    }
+                  ]
+                }
+                """
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, Data(llmPayload.utf8))
+            }
+
+            let onlineClient = OpenAICompatibleIntelligenceClient(
+                configuration: OpenAICompatibleConfiguration(
+                    baseURL: URL(string: "https://api.deepseek.com/v1")!,
+                    apiKey: "sk-recall-key",
+                    model: "deepseek-chat"
+                ),
+                urlSession: onlineSession
+            )
+            let onlineMatches = await onlineClient.rankRecall(query: "passwordless login idea", candidates: candidates)
+            try expectEqual(onlineMatches.map(\.id), ["d2"])
+            try expectEqual(onlineMatches.first?.raw, "调研 WebAuthn Passkey 免密方案")
+
+            let offlineSession = makeOpenAIMockURLSession { _ in
+                throw URLError(.notConnectedToInternet)
+            }
+            let offlineClient = OpenAICompatibleIntelligenceClient(
+                configuration: OpenAICompatibleConfiguration(
+                    baseURL: URL(string: "https://api.deepseek.com/v1")!,
+                    apiKey: "sk-recall-key",
+                    model: "deepseek-chat"
+                ),
+                urlSession: offlineSession
+            )
+
+            let authFallback = await offlineClient.rankRecall(query: "authentication signin", candidates: candidates)
+            try expectEqual(authFallback.first?.id, "d2")
+
+            let carFallback = await offlineClient.rankRecall(query: "car policy renewal", candidates: candidates)
+            try expectEqual(carFallback.first?.id, "d3")
+        }
+    },
+    TestCase(name: "recall_retrieves_deep_items_by_vague_impression_and_resurface_respects_three_berth_cap") {
+        struct ContextualRecallFake: IntelligenceClient {
+            func prepareDrop(raw: String, explicitLane: Lane?) async -> DropPrepAnalysis {
+                let lane = explicitLane ?? DockEngine.inferLaneLocally(for: raw)
+                return DropPrepAnalysis(lane: lane, prep: "Prepared cue for: \(raw.prefix(18))", prepState: .ready)
+            }
+
+            func rankRecall(query: String, candidates: [DockItem]) async -> [DockItem] {
+                if query.localizedCaseInsensitiveContains("stripe gateway") {
+                    let first = candidates.filter { $0.raw.contains("504") }
+                    let second = candidates.filter { $0.raw.contains("Webhook") }
+                    return first + second
+                }
+                return LocalRecallRanker.rank(query: query, candidates: candidates)
+            }
+        }
+
+        try runAsyncTest {
+            try await withTempDatabasePathAsync { dbPath in
+                let engine = try DockEngine(
+                    databasePath: dbPath,
+                    intelligenceClient: ContextualRecallFake()
+                )
+
+                let active1 = try engine.drop("Active 1: Current 504 investigation on Dock", lane: .work)
+                let active2 = try engine.drop("Active 2: Active sprint task", lane: .work)
+
+                let sacredDeep1 = "  排查上个月支付回调偶发 504 超时根因  "
+                let deep1 = try engine.drop(sacredDeep1, lane: .work)
+                let deep2 = try engine.drop("Webhook 签名重试幂等笔记", lane: .work)
+                let deep3 = try engine.drop("老家父母年度体检预约医院清单", lane: .life)
+
+                _ = try await engine.awaitPrep(id: active1.id)
+                _ = try await engine.awaitPrep(id: active2.id)
+                _ = try await engine.awaitPrep(id: deep1.id)
+                _ = try await engine.awaitPrep(id: deep2.id)
+                _ = try await engine.awaitPrep(id: deep3.id)
+
+                _ = try engine.reclassify(id: deep1.id, to: .deep)
+                _ = try engine.reclassify(id: deep2.id, to: .deep)
+                _ = try engine.reclassify(id: deep3.id, to: .deep)
+
+                let emptyHits = try await engine.recall(query: "   ")
+                try expectEqual(emptyHits, [])
+
+                let ranked = try await engine.recall(query: "that stripe gateway issue from weeks ago")
+                try expectEqual(ranked.map(\.id), [deep1.id, deep2.id], "Recall must rank matching Deep items and exclude active Dock items")
+                try expectEqual(ranked[0].raw, sacredDeep1, "Sacred raw wording must be preserved in Recall")
+
+                let medicalHits = try await engine.recall(query: "doctor clinic health check")
+                try expectEqual(medicalHits.map(\.id), [deep3.id])
+
+                let resurfacedOpen = try engine.resurface(id: deep3.id)
+                try expectEqual(resurfacedOpen.status, .docked)
+                try expectEqual(resurfacedOpen.lane, .work)
+                try expectEqual(resurfacedOpen.raw, "老家父母年度体检预约医院清单")
+
+                let dockAtCap = try engine.getDock(lane: .work)
+                try expectEqual(dockAtCap.berths.map(\.id), [active1.id, active2.id, deep3.id])
+                try expectEqual(dockAtCap.queuedCount, 0)
+                try expectEqual(dockAtCap.deepCount, 2)
+
+                let resurfacedQueued = try engine.resurface(id: deep1.id)
+                try expectEqual(resurfacedQueued.status, .queued)
+                try expectEqual(resurfacedQueued.raw, sacredDeep1)
+
+                let dockWithQueue = try engine.getDock(lane: .work)
+                try expectEqual(dockWithQueue.berths.count, 3)
+                try expectEqual(dockWithQueue.queuedCount, 1)
+                try expectEqual(dockWithQueue.deepCount, 1)
+
+                let resolved = try engine.resolveBerth(id: active2.id)
+                try expectEqual(resolved.promotedItem?.id, deep1.id)
             }
         }
     }

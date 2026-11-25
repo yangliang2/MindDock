@@ -34,7 +34,9 @@ let package = Package(
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("SwiftUI"),
-                .linkedFramework("Carbon")
+                .linkedFramework("Carbon"),
+                .linkedFramework("AVFoundation"),
+                .linkedFramework("Speech")
             ]
         ),
         .executableTarget(

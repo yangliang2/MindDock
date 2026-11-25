@@ -4,7 +4,7 @@ import SwiftUI
 @MainActor
 final class EdgeDockPanel: NSPanel {
     init<Content: View>(rootView: Content) {
-        let initialRect = NSRect(x: 0, y: 0, width: 320, height: 470)
+        let initialRect = NSRect(x: 0, y: 0, width: 320, height: 500)
         super.init(
             contentRect: initialRect,
             styleMask: [.nonactivatingPanel, .borderless],
@@ -23,6 +23,7 @@ final class EdgeDockPanel: NSPanel {
         isMovableByWindowBackground = true
 
         let hosting = NSHostingView(rootView: rootView)
+        hosting.sizingOptions = [.intrinsicContentSize]
         hosting.frame = initialRect
         contentView = hosting
 
@@ -45,9 +46,10 @@ final class EdgeDockPanel: NSPanel {
 @MainActor
 final class QuickDropPanel: NSPanel {
     var onCancel: (() -> Void)?
+    var onDidResignKey: (() -> Void)?
 
     init<Content: View>(rootView: Content) {
-        let initialRect = NSRect(x: 0, y: 0, width: 540, height: 118)
+        let initialRect = NSRect(x: 0, y: 0, width: 560, height: 132)
         super.init(
             contentRect: initialRect,
             styleMask: [.nonactivatingPanel, .titled, .fullSizeContentView],
@@ -71,6 +73,7 @@ final class QuickDropPanel: NSPanel {
         standardWindowButton(.zoomButton)?.isHidden = true
 
         let hosting = NSHostingView(rootView: rootView)
+        hosting.sizingOptions = [.intrinsicContentSize]
         hosting.frame = initialRect
         contentView = hosting
 
@@ -84,11 +87,16 @@ final class QuickDropPanel: NSPanel {
         onCancel?()
     }
 
+    override func resignKey() {
+        super.resignKey()
+        onDidResignKey?()
+    }
+
     func centerNearUpperThird() {
         guard let screen = NSScreen.main ?? NSScreen.screens.first else { return }
         let visible = screen.visibleFrame
         let originX = visible.midX - (frame.width / 2)
-        let originY = visible.minY + (visible.height * 0.68)
+        let originY = visible.minY + (visible.height * 0.65)
         setFrameOrigin(NSPoint(x: originX, y: originY))
     }
 }

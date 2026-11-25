@@ -22,14 +22,32 @@ public final class DockEngine: @unchecked Sendable {
     private let lock = NSLock()
     private var db: OpaquePointer?
     private var currentActiveLane: Lane = .work
+    public let intelligenceClient: any IntelligenceClient
     private var mobileBridge: (any MobileBridgeClient)?
     private var audioTranscriber: (any AudioTranscriber)?
+    private var prepTasks: [String: Task<DockItem?, Never>] = [:]
+    private var dockChangedCallback: (@Sendable () -> Void)?
+
+    public var onDockChanged: (@Sendable () -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return dockChangedCallback
+        }
+        set {
+            lock.lock()
+            dockChangedCallback = newValue
+            lock.unlock()
+        }
+    }
 
     public init(
         databasePath: String,
+        intelligenceClient: any IntelligenceClient = OpenAICompatibleIntelligenceClient(configuration: .unconfigured),
         mobileBridge: (any MobileBridgeClient)? = nil,
         audioTranscriber: (any AudioTranscriber)? = nil
     ) throws {
+        self.intelligenceClient = intelligenceClient
         self.mobileBridge = mobileBridge
         self.audioTranscriber = audioTranscriber
         if databasePath != ":memory:" {
@@ -44,6 +62,9 @@ public final class DockEngine: @unchecked Sendable {
             if let handle { sqlite3_close(handle) }
             throw DockError.storageFailure(message)
         }
+        if let handle {
+            sqlite3_busy_timeout(handle, 5000)
+        }
         self.db = handle
 
         try execute("""
@@ -53,6 +74,7 @@ public final class DockEngine: @unchecked Sendable {
                 id TEXT NOT NULL UNIQUE,
                 raw TEXT NOT NULL,
                 lane TEXT NOT NULL,
+                lane_locked INTEGER NOT NULL DEFAULT 0,
                 status TEXT NOT NULL,
                 prep TEXT,
                 prep_state TEXT NOT NULL,
@@ -69,6 +91,7 @@ public final class DockEngine: @unchecked Sendable {
                 processed_at REAL NOT NULL
             );
             """)
+        try ensureColumnExistsUnlocked(table: "dock_items", column: "lane_locked", definition: "INTEGER NOT NULL DEFAULT 0")
 
         if let savedLane = try readMetaUnlocked(key: "active_lane"),
            let parsed = Lane(rawValue: savedLane) {
@@ -80,8 +103,16 @@ public final class DockEngine: @unchecked Sendable {
     }
 
     deinit {
+        lock.lock()
+        let tasks = Array(prepTasks.values)
+        prepTasks.removeAll()
         if let db {
             sqlite3_close(db)
+            self.db = nil
+        }
+        lock.unlock()
+        for task in tasks {
+            task.cancel()
         }
     }
 
@@ -103,46 +134,95 @@ public final class DockEngine: @unchecked Sendable {
             throw DockError.emptyDrop
         }
 
-        lock.lock()
-        defer { lock.unlock() }
+        let explicitLane = lane
+        let item: DockItem = try {
+            lock.lock()
+            defer { lock.unlock() }
 
-        return try inTransaction {
-            let resolvedLane = lane ?? Self.inferLaneLocally(for: raw)
-            let dockedCount = try countItems(lane: resolvedLane, status: .docked)
-            let newStatus: ItemStatus = dockedCount < Self.maxBerths ? .docked : .queued
-            let orderSeq = try nextOrderSeqUnlocked()
-            let now = Date()
-            let item = DockItem(
-                id: UUID().uuidString.lowercased(),
-                raw: raw,
-                lane: resolvedLane,
-                status: newStatus,
-                prep: nil,
-                prepState: .pending,
-                createdAt: now,
-                updatedAt: now
-            )
+            return try inTransaction {
+                let resolvedLane = explicitLane ?? Self.inferLaneLocally(for: raw)
+                let dockedCount = try countItems(lane: resolvedLane, status: .docked)
+                let newStatus: ItemStatus = dockedCount < Self.maxBerths ? .docked : .queued
+                let orderSeq = try nextOrderSeqUnlocked()
+                let now = Date()
+                let created = DockItem(
+                    id: UUID().uuidString.lowercased(),
+                    raw: raw,
+                    lane: resolvedLane,
+                    status: newStatus,
+                    prep: nil,
+                    prepState: .pending,
+                    createdAt: now,
+                    updatedAt: now
+                )
 
-            try withStatement("""
-                INSERT INTO dock_items (id, raw, lane, status, prep, prep_state, order_seq, created_at, updated_at)
-                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);
-                """) { stmt in
-                bindText(stmt, index: 1, value: item.id)
-                bindText(stmt, index: 2, value: item.raw)
-                bindText(stmt, index: 3, value: item.lane.rawValue)
-                bindText(stmt, index: 4, value: item.status.rawValue)
-                bindOptionalText(stmt, index: 5, value: item.prep)
-                bindText(stmt, index: 6, value: item.prepState.rawValue)
-                sqlite3_bind_int64(stmt, 7, orderSeq)
-                sqlite3_bind_double(stmt, 8, item.createdAt.timeIntervalSince1970)
-                sqlite3_bind_double(stmt, 9, item.updatedAt.timeIntervalSince1970)
+                try withStatement("""
+                    INSERT INTO dock_items (id, raw, lane, lane_locked, status, prep, prep_state, order_seq, created_at, updated_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);
+                    """) { stmt in
+                    bindText(stmt, index: 1, value: created.id)
+                    bindText(stmt, index: 2, value: created.raw)
+                    bindText(stmt, index: 3, value: created.lane.rawValue)
+                    sqlite3_bind_int(stmt, 4, explicitLane == nil ? 0 : 1)
+                    bindText(stmt, index: 5, value: created.status.rawValue)
+                    bindOptionalText(stmt, index: 6, value: created.prep)
+                    bindText(stmt, index: 7, value: created.prepState.rawValue)
+                    sqlite3_bind_int64(stmt, 8, orderSeq)
+                    sqlite3_bind_double(stmt, 9, created.createdAt.timeIntervalSince1970)
+                    sqlite3_bind_double(stmt, 10, created.updatedAt.timeIntervalSince1970)
 
-                if sqlite3_step(stmt) != SQLITE_DONE {
-                    throw lastSQLiteError()
+                    if sqlite3_step(stmt) != SQLITE_DONE {
+                        throw lastSQLiteError()
+                    }
                 }
-            }
 
-            return item
+                return created
+            }
+        }()
+
+        scheduleBackgroundPrep(for: item, explicitLane: explicitLane)
+        return item
+    }
+
+    @discardableResult
+    public func awaitPrep(id: String) async throws -> DockItem {
+        let existingTask: Task<DockItem?, Never>? = {
+            lock.lock()
+            defer { lock.unlock() }
+            return prepTasks[id]
+        }()
+
+        if let existingTask {
+            _ = await existingTask.value
+        }
+
+        let currentAndLocked: (DockItem, Bool)? = try {
+            lock.lock()
+            defer { lock.unlock() }
+            guard let item = try fetchItemUnlocked(id: id) else { return nil }
+            let locked = try isLaneLockedUnlocked(id: id)
+            return (item, locked)
+        }()
+
+        guard let (current, locked) = currentAndLocked else {
+            throw DockError.itemNotFound(id)
+        }
+
+        if current.prepState == .pending {
+            let analysis = await intelligenceClient.prepareDrop(
+                raw: current.raw,
+                explicitLane: locked ? current.lane : nil
+            )
+            if let updated = completePrep(id: id, analysis: analysis) {
+                return updated
+            }
+        }
+
+        return try lock.withLock {
+            guard let refreshed = try fetchItemUnlocked(id: id) else {
+                throw DockError.itemNotFound(id)
+            }
+            return refreshed
         }
     }
 
@@ -479,6 +559,7 @@ public final class DockEngine: @unchecked Sendable {
                     lane: destLane,
                     status: newStatus,
                     orderSeq: newOrderSeq,
+                    laneLocked: true,
                     updatedAt: now
                 )
 
@@ -509,6 +590,72 @@ public final class DockEngine: @unchecked Sendable {
         return try queryItems(
             sql: "SELECT id, raw, lane, status, prep, prep_state, created_at, updated_at FROM dock_items WHERE status = 'deep' ORDER BY updated_at DESC, seq DESC;"
         )
+    }
+
+    public func recall(query: String) async throws -> [DockItem] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        let candidates = try deepItems()
+        guard !candidates.isEmpty else { return [] }
+
+        let ranked = await intelligenceClient.rankRecall(query: trimmed, candidates: candidates)
+        let deepByID = Dictionary(uniqueKeysWithValues: candidates.map { ($0.id, $0) })
+        var seen = Set<String>()
+        var verified: [DockItem] = []
+        for candidate in ranked {
+            if !seen.contains(candidate.id), let authoritative = deepByID[candidate.id] {
+                seen.insert(candidate.id)
+                verified.append(authoritative)
+            }
+        }
+        return verified
+    }
+
+    @discardableResult
+    public func resurface(id: String, lane: Lane? = nil) throws -> DockItem {
+        var callback: (@Sendable () -> Void)?
+        let resurfaced: DockItem = try {
+            lock.lock()
+            defer { lock.unlock() }
+
+            let result = try inTransaction { () -> DockItem in
+                guard let current = try fetchItemUnlocked(id: id) else {
+                    throw DockError.itemNotFound(id)
+                }
+                let destLane = lane ?? currentActiveLane
+                if current.status != .deep && current.lane == destLane {
+                    return current
+                }
+
+                let now = Date()
+                let dockedInDest = try countItems(lane: destLane, status: .docked)
+                let newStatus: ItemStatus = dockedInDest < Self.maxBerths ? .docked : .queued
+                let newOrderSeq = try nextOrderSeqUnlocked()
+
+                try updateItemUnlocked(
+                    id: id,
+                    lane: destLane,
+                    status: newStatus,
+                    orderSeq: newOrderSeq,
+                    laneLocked: true,
+                    updatedAt: now
+                )
+
+                if current.status == .docked && current.lane != destLane {
+                    _ = try promoteOldestQueuedUnlocked(in: current.lane, now: now)
+                }
+
+                guard let updated = try fetchItemUnlocked(id: id) else {
+                    throw DockError.itemNotFound(id)
+                }
+                return updated
+            }
+            callback = dockChangedCallback
+            return result
+        }()
+        callback?()
+        return resurfaced
     }
 
     // MARK: - Internal SQLite Helpers
@@ -630,22 +777,149 @@ public final class DockEngine: @unchecked Sendable {
         return matches.first
     }
 
+    private func scheduleBackgroundPrep(for item: DockItem, explicitLane: Lane?) {
+        let client = self.intelligenceClient
+        let itemID = item.id
+        let itemRaw = item.raw
+        lock.lock()
+        let task = Task { [weak self] () -> DockItem? in
+            let analysis = await client.prepareDrop(raw: itemRaw, explicitLane: explicitLane)
+            guard !Task.isCancelled else { return nil }
+            return self?.completePrep(id: itemID, analysis: analysis)
+        }
+        prepTasks[itemID] = task
+        lock.unlock()
+    }
+
+    private func completePrep(id: String, analysis: DropPrepAnalysis) -> DockItem? {
+        var callback: (@Sendable () -> Void)?
+        let updatedItem: DockItem? = {
+            lock.lock()
+            defer { lock.unlock() }
+            prepTasks.removeValue(forKey: id)
+            guard db != nil else { return nil }
+
+            let result = try? inTransaction { () -> DockItem? in
+                guard let current = try fetchItemUnlocked(id: id) else { return nil }
+                let locked = try isLaneLockedUnlocked(id: id)
+                let clampedPrep = DropPrepAnalysis.clampPrepLines(analysis.prep)
+                let finalPrepState: PrepState = (clampedPrep != nil && analysis.prepState == .ready) ? .ready : .skipped
+
+                // Preserve any Prep already attached explicitly (e.g., mobile bridge local cue) when LLM is unconfigured/skipped
+                if finalPrepState == .skipped && current.prepState != .pending {
+                    return current
+                }
+
+                let now = Date()
+
+                if !locked && current.status != .deep && analysis.lane != current.lane {
+                    let destLane = analysis.lane
+                    let dockedInDest = try countItems(lane: destLane, status: .docked)
+                    let newStatus: ItemStatus = dockedInDest < Self.maxBerths ? .docked : .queued
+                    let newOrderSeq = try nextOrderSeqUnlocked()
+
+                    try withStatement("""
+                        UPDATE dock_items
+                        SET lane = ?1, status = ?2, order_seq = ?3, prep = ?4, prep_state = ?5, updated_at = ?6
+                        WHERE id = ?7;
+                        """) { stmt in
+                        bindText(stmt, index: 1, value: destLane.rawValue)
+                        bindText(stmt, index: 2, value: newStatus.rawValue)
+                        sqlite3_bind_int64(stmt, 3, newOrderSeq)
+                        bindOptionalText(stmt, index: 4, value: clampedPrep)
+                        bindText(stmt, index: 5, value: finalPrepState.rawValue)
+                        sqlite3_bind_double(stmt, 6, now.timeIntervalSince1970)
+                        bindText(stmt, index: 7, value: id)
+                        if sqlite3_step(stmt) != SQLITE_DONE {
+                            throw lastSQLiteError()
+                        }
+                    }
+
+                    if current.status == .docked {
+                        _ = try promoteOldestQueuedUnlocked(in: current.lane, now: now)
+                    }
+                } else {
+                    try withStatement("""
+                        UPDATE dock_items
+                        SET prep = ?1, prep_state = ?2, updated_at = ?3
+                        WHERE id = ?4;
+                        """) { stmt in
+                        bindOptionalText(stmt, index: 1, value: clampedPrep)
+                        bindText(stmt, index: 2, value: finalPrepState.rawValue)
+                        sqlite3_bind_double(stmt, 3, now.timeIntervalSince1970)
+                        bindText(stmt, index: 4, value: id)
+                        if sqlite3_step(stmt) != SQLITE_DONE {
+                            throw lastSQLiteError()
+                        }
+                    }
+                }
+
+                return try fetchItemUnlocked(id: id)
+            }
+
+            if result != nil {
+                callback = dockChangedCallback
+            }
+            return result ?? nil
+        }()
+
+        callback?()
+        return updatedItem
+    }
+
+    private func ensureColumnExistsUnlocked(table: String, column: String, definition: String) throws {
+        let hasColumn = try withStatement("PRAGMA table_info(\(table));") { stmt in
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if columnText(stmt, 1) == column {
+                    return true
+                }
+            }
+            return false
+        }
+        if !hasColumn {
+            try execute("ALTER TABLE \(table) ADD COLUMN \(column) \(definition);")
+        }
+    }
+
+    private func isLaneLockedUnlocked(id: String) throws -> Bool {
+        try withStatement("SELECT lane_locked FROM dock_items WHERE id = ?1 LIMIT 1;") { stmt in
+            bindText(stmt, index: 1, value: id)
+            guard sqlite3_step(stmt) == SQLITE_ROW else { return false }
+            return sqlite3_column_int(stmt, 0) != 0
+        }
+    }
+
     private func updateItemUnlocked(
         id: String,
         lane: Lane,
         status: ItemStatus,
         orderSeq: Int64?,
+        laneLocked: Bool? = nil,
         updatedAt: Date
     ) throws {
         if let orderSeq {
-            try withStatement("UPDATE dock_items SET lane = ?1, status = ?2, order_seq = ?3, updated_at = ?4 WHERE id = ?5;") { stmt in
-                bindText(stmt, index: 1, value: lane.rawValue)
-                bindText(stmt, index: 2, value: status.rawValue)
-                sqlite3_bind_int64(stmt, 3, orderSeq)
-                sqlite3_bind_double(stmt, 4, updatedAt.timeIntervalSince1970)
-                bindText(stmt, index: 5, value: id)
-                if sqlite3_step(stmt) != SQLITE_DONE {
-                    throw lastSQLiteError()
+            if let laneLocked {
+                try withStatement("UPDATE dock_items SET lane = ?1, status = ?2, order_seq = ?3, lane_locked = ?4, updated_at = ?5 WHERE id = ?6;") { stmt in
+                    bindText(stmt, index: 1, value: lane.rawValue)
+                    bindText(stmt, index: 2, value: status.rawValue)
+                    sqlite3_bind_int64(stmt, 3, orderSeq)
+                    sqlite3_bind_int(stmt, 4, laneLocked ? 1 : 0)
+                    sqlite3_bind_double(stmt, 5, updatedAt.timeIntervalSince1970)
+                    bindText(stmt, index: 6, value: id)
+                    if sqlite3_step(stmt) != SQLITE_DONE {
+                        throw lastSQLiteError()
+                    }
+                }
+            } else {
+                try withStatement("UPDATE dock_items SET lane = ?1, status = ?2, order_seq = ?3, updated_at = ?4 WHERE id = ?5;") { stmt in
+                    bindText(stmt, index: 1, value: lane.rawValue)
+                    bindText(stmt, index: 2, value: status.rawValue)
+                    sqlite3_bind_int64(stmt, 3, orderSeq)
+                    sqlite3_bind_double(stmt, 4, updatedAt.timeIntervalSince1970)
+                    bindText(stmt, index: 5, value: id)
+                    if sqlite3_step(stmt) != SQLITE_DONE {
+                        throw lastSQLiteError()
+                    }
                 }
             }
         } else {

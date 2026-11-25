@@ -1,6 +1,7 @@
+import Combine
 import Foundation
-import SwiftUI
 import MindDockCore
+import SwiftUI
 
 public enum DropLaneChoice: String, CaseIterable, Sendable {
     case auto
@@ -16,20 +17,58 @@ public enum DropLaneChoice: String, CaseIterable, Sendable {
     }
 }
 
+public enum QuickBarMode: String, CaseIterable, Sendable {
+    case drop
+    case recall
+
+    public var label: String {
+        switch self {
+        case .drop: return "Drop"
+        case .recall: return "Recall"
+        }
+    }
+}
+
 @MainActor
 final class DockViewModel: ObservableObject {
     let engine: DockEngine
+    let voiceController: VoiceCaptureController
 
     @Published private(set) var snapshot: DockSnapshot
     @Published var statusBanner: String?
     @Published var draftText: String = ""
     @Published var dropLaneChoice: DropLaneChoice = .auto
 
+    @Published var quickBarMode: QuickBarMode = .drop
+    @Published var recallQuery: String = ""
+    @Published private(set) var recallResults: [DockItem] = []
+    @Published private(set) var isRecalling: Bool = false
+
+    private var cancellables = Set<AnyCancellable>()
     var onStateChanged: (() -> Void)?
 
-    init(engine: DockEngine) throws {
+    init(
+        engine: DockEngine,
+        voiceController: VoiceCaptureController? = nil
+    ) throws {
         self.engine = engine
+        self.voiceController = voiceController ?? VoiceCaptureController(
+            intelligenceClient: engine.intelligenceClient,
+            hasASRFallbackEndpoint: (engine.intelligenceClient as? OpenAICompatibleIntelligenceClient)?.configuration.asrEndpointURL != nil
+        )
         self.snapshot = try engine.getDock()
+
+        self.voiceController.objectWillChange
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+
+        engine.onDockChanged = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.refresh()
+            }
+        }
     }
 
     var predictedLaneForDraft: Lane {
@@ -56,8 +95,34 @@ final class DockViewModel: ObservableObject {
         }
     }
 
+    func setQuickBarMode(_ mode: QuickBarMode) {
+        if mode != .drop {
+            stopVoiceCapture()
+        }
+        quickBarMode = mode
+        if mode == .recall && recallQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            recallResults = (try? Array(engine.deepItems().prefix(5))) ?? []
+        }
+    }
+
+    func toggleVoiceCapture() {
+        voiceController.toggleCapture(currentDraft: draftText) { [weak self] updatedText in
+            self?.draftText = updatedText
+        }
+    }
+
+    func stopVoiceCapture() {
+        voiceController.stopCapture(finalizeWithASRIfNeeded: false)
+    }
+
+    func cancelQuickBarSession() {
+        voiceController.cancelCapture()
+    }
+
     @discardableResult
     func submitDraftDrop() -> Bool {
+        stopVoiceCapture()
+
         let raw = draftText
         guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return false
@@ -76,7 +141,7 @@ final class DockViewModel: ObservableObject {
             dropLaneChoice = .auto
             snapshot = try engine.getDock()
             if item.lane != snapshot.activeLane {
-                statusBanner = "Dropped to \(item.lane.rawValue.capitalized) off-stage"
+                statusBanner = "Dropped to \(item.lane.rawValue.capitalized) off-stage · Prep running"
             } else if item.status == .queued {
                 statusBanner = "3 Berths full — queued off-stage (FIFO)"
             } else {
@@ -87,6 +152,43 @@ final class DockViewModel: ObservableObject {
         } catch {
             statusBanner = "Drop failed: \(error)"
             return false
+        }
+    }
+
+    func performRecall() async {
+        let trimmed = recallQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            recallResults = (try? Array(engine.deepItems().prefix(5))) ?? []
+            isRecalling = false
+            return
+        }
+
+        isRecalling = true
+        defer { isRecalling = false }
+        do {
+            recallResults = try await engine.recall(query: trimmed)
+        } catch {
+            statusBanner = "Recall failed: \(error)"
+            recallResults = []
+        }
+    }
+
+    @discardableResult
+    func resurfaceFromRecall(id: String) -> DockItem? {
+        do {
+            let item = try engine.resurface(id: id)
+            recallResults.removeAll { $0.id == id }
+            snapshot = try engine.getDock()
+            if item.status == .docked {
+                statusBanner = "Resurfaced to \(item.lane.rawValue.capitalized) Berth"
+            } else {
+                statusBanner = "3 Berths full — resurfaced into \(item.lane.rawValue.capitalized) queue"
+            }
+            onStateChanged?()
+            return item
+        } catch {
+            statusBanner = "Resurface failed: \(error)"
+            return nil
         }
     }
 

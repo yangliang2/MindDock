@@ -1,6 +1,6 @@
 import AppKit
-import SwiftUI
 import MindDockCore
+import SwiftUI
 
 @MainActor
 final class FocusTriggerModel: ObservableObject {
@@ -21,16 +21,23 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         do {
+            let llmConfig = OpenAICompatibleConfiguration.fromEnvironmentOrDefaults()
+            let intelligence = OpenAICompatibleIntelligenceClient(configuration: llmConfig)
             let transcriber = MacOSAudioTranscriber()
             let mobileBridge: (any MobileBridgeClient)? = MobileBridgeConfig.fromEnvironment().map {
                 FeishuMobileBridgeClient(config: $0, audioTranscriber: transcriber)
             }
             let engine = try DockEngine(
                 databasePath: DockEngine.defaultDatabasePath(),
+                intelligenceClient: intelligence,
                 mobileBridge: mobileBridge,
                 audioTranscriber: transcriber
             )
-            let vm = try DockViewModel(engine: engine)
+            let voice = VoiceCaptureController(
+                intelligenceClient: intelligence,
+                hasASRFallbackEndpoint: llmConfig.asrEndpointURL != nil
+            )
+            let vm = try DockViewModel(engine: engine, voiceController: voice)
             self.viewModel = vm
 
             setupPanels(with: vm)
@@ -51,6 +58,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        viewModel?.cancelQuickBarSession()
         shiftMonitor?.stop()
         HotKeyManager.shared.unregisterAll()
     }
@@ -60,7 +68,8 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
     private func setupPanels(with vm: DockViewModel) {
         let edgeView = EdgeDockView(
             viewModel: vm,
-            onOpenQuickDrop: { [weak self] in self?.showQuickDrop() },
+            onOpenQuickDrop: { [weak self] in self?.showQuickDrop(mode: .drop) },
+            onOpenRecall: { [weak self] in self?.showQuickDrop(mode: .recall) },
             onHideDock: { [weak self] in self?.hideEdgeDock() }
         )
         self.edgeDockPanel = EdgeDockPanel(rootView: edgeView)
@@ -74,6 +83,9 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         let quickPanel = QuickDropPanel(rootView: quickDropHost)
         quickPanel.onCancel = { [weak self] in
             self?.dismissQuickDropAndRestoreFocus()
+        }
+        quickPanel.onDidResignKey = { [weak self] in
+            self?.viewModel?.stopVoiceCapture()
         }
         self.quickDropPanel = quickPanel
     }
@@ -92,6 +104,14 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         )
         quickDropItem.target = self
         menu.addItem(quickDropItem)
+
+        let recallItem = NSMenuItem(
+            title: "Recall from Deep…",
+            action: #selector(handleRecallMenu),
+            keyEquivalent: ""
+        )
+        recallItem.target = self
+        menu.addItem(recallItem)
 
         let toggleDockItem = NSMenuItem(
             title: "Toggle Edge Dock (⌥⇧Space)",
@@ -205,16 +225,17 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         if panel.isVisible && panel.isKeyWindow {
             dismissQuickDropAndRestoreFocus()
         } else {
-            showQuickDrop()
+            showQuickDrop(mode: .drop)
         }
     }
 
-    func showQuickDrop() {
+    func showQuickDrop(mode: QuickBarMode = .drop) {
         guard let panel = quickDropPanel else { return }
         if let frontmost = NSWorkspace.shared.frontmostApplication,
            frontmost.processIdentifier != ProcessInfo.processInfo.processIdentifier {
             previousExternalApp = frontmost
         }
+        viewModel?.setQuickBarMode(mode)
         panel.centerNearUpperThird()
         focusTrigger.token &+= 1
         NSApp.activate()
@@ -222,6 +243,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func dismissQuickDropAndRestoreFocus() {
+        viewModel?.cancelQuickBarSession()
         quickDropPanel?.orderOut(nil)
         if let previousExternalApp, !previousExternalApp.isTerminated {
             previousExternalApp.activate()
@@ -232,7 +254,11 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Menu Actions
 
     @objc private func handleQuickDropMenu() {
-        showQuickDrop()
+        showQuickDrop(mode: .drop)
+    }
+
+    @objc private func handleRecallMenu() {
+        showQuickDrop(mode: .recall)
     }
 
     @objc private func handleToggleEdgeDockMenu() {
