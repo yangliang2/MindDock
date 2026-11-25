@@ -32,3 +32,10 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+
+# Swift / macOS
+.build/
+.swiftpm/
+dist/
+*.app/
+
