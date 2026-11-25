@@ -1,0 +1,1604 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MindDock Prototype — 跨场景注意力停靠坞概念验证</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --surface: #ffffff;
+      --surface-muted: #eef0f4;
+      --border: #e1e4ea;
+      --text: #141619;
+      --text-secondary: #5b616e;
+      --text-muted: #8c93a0;
+      --accent: #2563eb;
+      --accent-soft: #eff4ff;
+      --life: #059669;
+      --life-soft: #ecfdf5;
+      --prep: #d97706;
+      --prep-soft: #fffbeb;
+      --radius: 14px;
+      --shadow-sm: 0 2px 8px rgba(15, 23, 42, 0.05);
+      --shadow-lg: 0 18px 44px rgba(15, 23, 42, 0.14);
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+      padding-bottom: 96px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* Top Prototype Header (Throwaway Banner + Question + Scenario Runner) */
+    .proto-header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 18px 28px;
+    }
+
+    .proto-header-inner {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    .proto-badge-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+
+    .proto-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--prep);
+      background: var(--prep-soft);
+      border: 1px solid #fde68a;
+      padding: 3px 9px;
+      border-radius: 999px;
+    }
+
+    .proto-title {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    .proto-question {
+      font-size: 13px;
+      color: var(--text-secondary);
+      margin-top: 4px;
+      max-width: 940px;
+    }
+
+    /* Controls Bar: Drop Input + Shift Context + Walkthrough Tabs */
+    .control-deck {
+      max-width: 1200px;
+      margin: 16px auto 0;
+      padding: 0 28px;
+      display: grid;
+      grid-template-columns: 1.4fr 1fr;
+      gap: 14px;
+    }
+
+    @media (max-width: 920px) {
+      .control-deck { grid-template-columns: 1fr; }
+    }
+
+    .card-panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px 16px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .panel-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .drop-bar {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .drop-input {
+      flex: 1;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 9px 12px;
+      font-size: 14px;
+      font-family: inherit;
+      outline: none;
+      background: #fafbfc;
+    }
+
+    .drop-input:focus {
+      border-color: var(--accent);
+      background: #fff;
+      box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+    }
+
+    .btn {
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      padding: 8px 13px;
+      border-radius: 9px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      font-family: inherit;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .btn:hover { background: var(--surface-muted); }
+    .btn-primary { background: var(--text); color: #fff; border-color: var(--text); }
+    .btn-primary:hover { background: #2c313a; }
+    .btn-accent { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .btn-accent:hover { background: #1d4ed8; }
+    .btn-voice.recording { background: #dc2626; color: #fff; border-color: #dc2626; }
+
+    .quick-presets {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 9px;
+    }
+
+    .preset-chip {
+      font-size: 12px;
+      color: var(--text-secondary);
+      background: var(--surface-muted);
+      border: 1px solid transparent;
+      padding: 4px 9px;
+      border-radius: 999px;
+      cursor: pointer;
+    }
+
+    .preset-chip:hover {
+      border-color: var(--border);
+      color: var(--text);
+    }
+
+    /* Shift Toggle */
+    .shift-box {
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .shift-segmented {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      background: var(--surface-muted);
+      padding: 4px;
+      border-radius: 10px;
+      gap: 4px;
+    }
+
+    .shift-btn {
+      border: none;
+      background: transparent;
+      padding: 8px 10px;
+      border-radius: 7px;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .shift-btn.active.work {
+      background: var(--surface);
+      color: var(--accent);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .shift-btn.active.life {
+      background: var(--surface);
+      color: var(--life);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .last-event-banner {
+      font-size: 12px;
+      color: var(--text-secondary);
+      background: #f8fafc;
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      padding: 7px 10px;
+    }
+
+    /* Walkthrough Bar */
+    .walkthrough-bar {
+      max-width: 1200px;
+      margin: 12px auto 0;
+      padding: 0 28px;
+    }
+
+    .walkthrough-tabs {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+
+    .wt-tab {
+      font-size: 12px;
+      padding: 5px 11px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text-secondary);
+      cursor: pointer;
+      font-weight: 500;
+    }
+
+    .wt-tab.active {
+      background: var(--accent-soft);
+      border-color: #bfdbfe;
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .wt-body {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .wt-desc {
+      font-size: 13px;
+      color: var(--text-secondary);
+      flex: 1;
+      min-width: 240px;
+    }
+
+    .wt-steps {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .wt-step-btn {
+      font-size: 12px;
+      padding: 6px 11px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      cursor: pointer;
+      font-family: inherit;
+    }
+
+    .wt-step-btn.next-step {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .wt-step-btn.done-step {
+      opacity: 0.5;
+    }
+
+    /* Main Stage for Variants */
+    .stage-wrap {
+      max-width: 1200px;
+      margin: 16px auto 0;
+      padding: 0 28px;
+    }
+
+    /* =========================================================
+       VARIANT A: Screen-Edge Strip (Desk) <-> Phone Lock Screen
+       ========================================================= */
+    .va-desktop-sim {
+      position: relative;
+      height: 500px;
+      border-radius: 18px;
+      background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
+      border: 1px solid #334155;
+      overflow: hidden;
+      display: flex;
+      box-shadow: var(--shadow-lg);
+    }
+
+    .va-ide-backdrop {
+      flex: 1;
+      padding: 28px 32px;
+      color: #64748b;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 13px;
+      user-select: none;
+    }
+
+    .va-ide-window {
+      background: rgba(15, 23, 42, 0.7);
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 18px;
+      max-width: 560px;
+      margin-top: 16px;
+    }
+
+    .va-edge-dock {
+      width: 330px;
+      background: rgba(255, 255, 255, 0.95);
+      backdrop-filter: blur(18px);
+      border-left: 1px solid rgba(255, 255, 255, 0.4);
+      padding: 18px 16px;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+    }
+
+    .va-dock-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    .berth-dots {
+      display: flex;
+      gap: 6px;
+    }
+
+    .berth-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #d1d5db;
+    }
+
+    .berth-dot.filled.work { background: var(--accent); }
+    .berth-dot.filled.life { background: var(--life); }
+
+    .berth-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+
+    .berth-item {
+      background: #fff;
+      border: 1px solid var(--border);
+      border-radius: 11px;
+      padding: 11px 12px;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .berth-raw {
+      font-size: 13.5px;
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .berth-prep {
+      margin-top: 6px;
+      font-size: 12px;
+      color: #1e40af;
+      background: var(--accent-soft);
+      border-radius: 7px;
+      padding: 6px 8px;
+    }
+
+    .berth-prep.life-prep {
+      color: #065f46;
+      background: var(--life-soft);
+    }
+
+    .berth-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .mini-btn {
+      border: none;
+      background: var(--surface-muted);
+      color: var(--text-secondary);
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 11.5px;
+      cursor: pointer;
+      font-weight: 600;
+    }
+
+    .mini-btn:hover { background: var(--text); color: #fff; }
+
+    .empty-berth-slot {
+      border: 1px dashed #cbd5e1;
+      border-radius: 10px;
+      padding: 12px;
+      text-align: center;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    /* Phone Lock Screen Simulation */
+    .va-phone-stage {
+      height: 500px;
+      border-radius: 18px;
+      background: #0b1120;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 36px;
+      padding: 20px;
+      box-shadow: var(--shadow-lg);
+    }
+
+    .phone-frame {
+      width: 320px;
+      height: 460px;
+      border-radius: 38px;
+      border: 6px solid #334155;
+      background: linear-gradient(170deg, #064e3b 0%, #0f172a 62%);
+      padding: 24px 16px 18px;
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      box-shadow: 0 20px 50px rgba(0,0,0,0.5);
+    }
+
+    .lock-clock {
+      text-align: center;
+    }
+
+    .lock-date { font-size: 12px; opacity: 0.8; }
+    .lock-time { font-size: 46px; font-weight: 700; letter-spacing: -0.03em; line-height: 1.05; margin-top: 2px; }
+
+    .lock-live-card {
+      background: rgba(255, 255, 255, 0.16);
+      backdrop-filter: blur(20px);
+      border: 1px solid rgba(255, 255, 255, 0.24);
+      border-radius: 20px;
+      padding: 13px 14px;
+    }
+
+    .lock-card-head {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      opacity: 0.78;
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 8px;
+    }
+
+    .lock-row {
+      padding: 8px 0;
+      border-top: 1px solid rgba(255,255,255,0.14);
+    }
+
+    .lock-row-title { font-size: 13.5px; font-weight: 600; }
+    .lock-row-prep { font-size: 11.5px; color: #a7f3d0; margin-top: 3px; }
+    .lock-row-btn {
+      margin-top: 6px;
+      background: rgba(255,255,255,0.22);
+      color: #fff;
+      border: none;
+      border-radius: 999px;
+      padding: 3px 10px;
+      font-size: 11px;
+      cursor: pointer;
+    }
+    .lock-row-btn:hover { background: #10b981; }
+
+    .lock-bottom-shortcuts {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0 8px;
+      font-size: 12px;
+      opacity: 0.85;
+    }
+
+    /* =========================================================
+       VARIANT B: Single-Focus Spotlight (Zero List Anxiety)
+       ========================================================= */
+    .vb-stage {
+      min-height: 460px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 40px 28px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .vb-spotlight-card {
+      max-width: 560px;
+      width: 100%;
+      text-align: center;
+    }
+
+    .vb-kicker {
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--accent-soft);
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 999px;
+      margin-bottom: 16px;
+    }
+
+    .vb-kicker.life { color: var(--life); background: var(--life-soft); }
+
+    .vb-hero-title {
+      font-size: 26px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 14px;
+    }
+
+    .vb-prep-box {
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 18px;
+      text-align: left;
+      font-size: 14px;
+      color: var(--text-secondary);
+      margin-bottom: 20px;
+    }
+
+    .vb-action-row {
+      display: flex;
+      justify-content: center;
+      gap: 10px;
+    }
+
+    /* =========================================================
+       VARIANT C: Split Horizon (Waterline: Active Berths / Deep)
+       ========================================================= */
+    .vc-stage {
+      border-radius: 18px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-sm);
+    }
+
+    .vc-above-water {
+      background: #ffffff;
+      padding: 28px;
+      min-height: 250px;
+    }
+
+    .vc-berth-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 14px;
+      margin-top: 14px;
+    }
+
+    @media (max-width: 820px) {
+      .vc-berth-grid { grid-template-columns: 1fr; }
+    }
+
+    .vc-waterline {
+      background: #0f172a;
+      color: #cbd5e1;
+      padding: 24px 28px;
+      min-height: 210px;
+    }
+
+    .recall-bar {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+      margin-bottom: 14px;
+    }
+
+    .recall-input {
+      flex: 1;
+      background: #1e293b;
+      border: 1px solid #334155;
+      color: #fff;
+      padding: 9px 13px;
+      border-radius: 9px;
+      font-size: 13.5px;
+      outline: none;
+    }
+
+    .recall-results {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .recall-hit {
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 9px;
+      padding: 9px 12px;
+      font-size: 13px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    /* State Inspector (LOGIC.md requirement: surface full relevant state) */
+    .state-inspector {
+      max-width: 1200px;
+      margin: 18px auto 0;
+      padding: 0 28px;
+    }
+
+    .inspector-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-top: 8px;
+    }
+
+    @media (max-width: 860px) {
+      .inspector-grid { grid-template-columns: 1fr 1fr; }
+    }
+
+    .stat-box {
+      background: #f8fafc;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font-size: 12.5px;
+    }
+
+    .stat-num { font-size: 18px; font-weight: 700; color: var(--text); }
+
+    /* Floating Variant Switcher (UI.md specification) */
+    .proto-switcher {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #111827;
+      color: #ffffff;
+      border-radius: 999px;
+      padding: 7px 10px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      box-shadow: 0 12px 32px rgba(0, 0, 0, 0.28);
+      z-index: 9999;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+    }
+
+    .sw-arrow {
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      border: none;
+      background: rgba(255, 255, 255, 0.12);
+      color: #fff;
+      font-size: 14px;
+      cursor: pointer;
+    }
+
+    .sw-arrow:hover { background: rgba(255, 255, 255, 0.25); }
+    .sw-label { font-size: 13px; font-weight: 600; padding: 0 6px; white-space: nowrap; }
+  </style>
+</head>
+<body>
+
+  <!-- 1. Question & Context Header -->
+  <header class="proto-header">
+    <div class="proto-header-inner">
+      <div class="proto-badge-row">
+        <span class="proto-badge">PROTOTYPE · THROWAWAY DEMO</span>
+        <span style="font-size:12px;color:var(--text-muted);">快捷键：按 <b>/</b> 聚焦闪投 · 按 <b>← / →</b> 切换底部 3 种 UI 变体</span>
+      </div>
+      <div class="proto-title">MindDock 体验与状态模型概念验证</div>
+      <p class="proto-question">
+        <b>验证问题：</b>① 当用户不打开独立 App，只靠「随口闪投（Drop）→ 换场接力（Shift：在工位 ↔ 离席手机锁屏）→ 后台备料（Prep）→ 3 泊位硬上限（Berth）」流转时，工作与生活断层是否真正消失？泊位满了怎么办？
+        ② 停靠台采用哪一种界面结构（底部切换 <b>A 边缘泊位条 / B 单点聚光灯 / C 水面与深海</b>）最没有清单压迫感？
+      </p>
+    </div>
+  </header>
+
+  <!-- 2. Universal Drop & Shift Controls -->
+  <section class="control-deck">
+    <div class="card-panel">
+      <div class="panel-label">
+        <span>1. 零分类闪投（Drop — 随口说或随手敲，不选文件夹不填日期）</span>
+        <span id="mic-hint" style="color:var(--accent);">支持麦克风语音</span>
+      </div>
+      <div class="drop-bar">
+        <input id="drop-input" class="drop-input" type="text" placeholder="随口丢一句（例如：周末前把车险续了 / 权限模块能不能砍掉角色表）..." />
+        <button id="voice-btn" class="btn btn-voice" type="button" title="语音闪投">🎙️ 说一句</button>
+        <button id="drop-submit" class="btn btn-primary" type="button">闪投入坞</button>
+      </div>
+      <div class="quick-presets">
+        <button class="preset-chip" data-drop="周末前记得给车续保，顺便看下去年保单多少钱">+ 生活：周末前给车续保</button>
+        <button class="preset-chip" data-drop="下班路过药店买盒儿童退烧贴">+ 生活：下班买退烧贴</button>
+        <button class="preset-chip" data-drop="刚想到权限模块是不是能直接砍掉角色表改用策略？">+ 工作灵感：砍掉角色表？</button>
+        <button class="preset-chip" data-drop="排查支付回调偶发 504 超时，怀疑是下游重试风暴">+ 工作插单：支付 504 超时</button>
+      </div>
+    </div>
+
+    <div class="card-panel shift-box">
+      <div>
+        <div class="panel-label">
+          <span>2. 自动换场模拟（Shift — 电脑活跃 vs 电脑合盖离席）</span>
+        </div>
+        <div class="shift-segmented">
+          <button id="shift-work" class="shift-btn work active" type="button">💻 在工位（电脑活跃）</button>
+          <button id="shift-life" class="shift-btn life" type="button">📱 离席回生活（手机锁屏）</button>
+        </div>
+      </div>
+      <div id="last-event" class="last-event-banner">当前状态：坐在电脑前工作。生活杂事已隐身退居后台，不打扰当前心流。</div>
+    </div>
+  </section>
+
+  <!-- 3. Guided Scenario Walkthroughs -->
+  <section class="walkthrough-bar">
+    <div class="card-panel">
+      <div class="panel-label">
+        <span>引导体验剧本（点击剧本重置初始状态，按顺序点按钮感受完整闭环）</span>
+        <button id="reset-demo" class="mini-btn" type="button">重置初始数据</button>
+      </div>
+      <div id="wt-tabs" class="walkthrough-tabs"></div>
+      <div class="wt-body">
+        <div id="wt-desc" class="wt-desc"></div>
+        <div id="wt-steps" class="wt-steps"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 4. Active UI Variant Stage -->
+  <main id="variant-stage" class="stage-wrap"></main>
+
+  <!-- 5. Transparent Domain State Inspector -->
+  <section class="state-inspector">
+    <div class="card-panel">
+      <div class="panel-label">
+        <span>底层实时状态透视（用于检验泊位硬上限、换场隐身与深海沉淀逻辑）</span>
+      </div>
+      <div id="inspector-grid" class="inspector-grid"></div>
+    </div>
+  </section>
+
+  <!-- 6. Floating Variant Switcher (UI.md spec) -->
+  <nav class="proto-switcher" aria-label="Prototype Variant Switcher">
+    <button id="prev-variant" class="sw-arrow" type="button" title="上一个变体 (←)">←</button>
+    <span id="variant-label" class="sw-label">A (屏幕边缘泊位条 & 手机锁屏)</span>
+    <button id="next-variant" class="sw-arrow" type="button" title="下一个变体 (→)">→</button>
+  </nav>
+
+  <!-- =====================================================================
+       PORTABLE PURE DOMAIN MODULE (Zero DOM references — liftable to src/)
+       ===================================================================== -->
+  <script id="minddock-domain-logic">
+    const MAX_BERTHS_PER_DOCK = 3;
+
+    const LIFE_SIGNALS = [
+      "下班", "周末", "车险", "续保", "买", "药", "娃", "孩子", "家", "老婆",
+      "父母", "体检", "快递", "水电", "猫", "狗", "牙医", "超市", "做饭", "报名"
+    ];
+
+    function inferLaneAndPrep(rawText) {
+      const isLife = LIFE_SIGNALS.some((kw) => rawText.includes(kw));
+      const lane = isLife ? "life" : "work";
+
+      let prepNote = "";
+      if (rawText.includes("车险") || rawText.includes("续保")) {
+        prepNote = "幕后备料：已关联去年保单（人保 ¥3,420，6月到期），整理好线上续保直达入口与比价要点。";
+      } else if (rawText.includes("药") || rawText.includes("退烧")) {
+        prepNote = "幕后备料：回家顺路最近 24h 药店距地铁口 120 米，常备物理退烧贴规格已附注。";
+      } else if (rawText.includes("角色表") || rawText.includes("权限")) {
+        prepNote = "幕后备料：已扫描工程结构——仅 2 个鉴权中间件引用 Role，改用策略（Policy）可行，附迁移草稿。";
+      } else if (rawText.includes("504") || rawText.includes("超时")) {
+        prepNote = "幕后备料：定位到网关默认 timeout=3s 而重试无退避，建议先加指数退避止血。";
+      } else if (isLife) {
+        prepNote = "幕后备料：已归入离席生活船位，下班亮起手机锁屏时自动浮现提醒。";
+      } else {
+        prepNote = "幕后备料：已提炼核心意图并关联历史上下文，留在工位台面随时接续。";
+      }
+
+      const tags = rawText
+        .replace(/[，。？！、,.?!]/g, " ")
+        .split(/\s+/)
+        .filter(Boolean);
+
+      return { lane, prepNote, tags };
+    }
+
+    function createInitialState() {
+      return {
+        activeContext: "work", // 'work' (At Desk) | 'life' (Away / Phone Lock Screen)
+        maxBerths: MAX_BERTHS_PER_DOCK,
+        spotlightIndex: 0,
+        recallQuery: "",
+        lastExplanation: "初始状态：你在工位电脑前。台面停着 1 件工作事项；早上顺口提过的 1 件家事隐身在后台等待下班。",
+        items: [
+          {
+            id: "item-1",
+            raw: "重构登录流程：试一下用 Passkey 替代短信验证码，省掉短信费用",
+            lane: "work",
+            status: "docked", // 'docked' | 'queued' | 'deep'
+            prep: "幕后备料：WebAuthn 在 iOS/macOS/Android Chrome 均已原生支持，预计可砍掉 75% 短信网关成本。",
+            createdAt: "今天 09:40"
+          },
+          {
+            id: "item-2",
+            raw: "下班顺路去丰巢把生鲜快递取了，别放过夜",
+            lane: "life",
+            status: "docked",
+            prep: "幕后备料：东门 3 号丰巢柜，保管期至今晚 23:00。",
+            createdAt: "今天 10:15"
+          },
+          {
+            id: "deep-1",
+            raw: "不用密码登录的野路子：可以让老设备扫码直接签发短期设备证书",
+            lane: "work",
+            status: "deep",
+            prep: "已归档灵感（2个月前）：零密码免短信的跨设备信任链设想。",
+            createdAt: "2 个月前"
+          },
+          {
+            id: "deep-2",
+            raw: "去年给车办保险时对比过三家，返现后人保最划算，业务员小陈挺靠谱",
+            lane: "life",
+            status: "deep",
+            prep: "已办结生活记录（去年）：车险比价结论。",
+            createdAt: "11 个月前"
+          }
+        ]
+      };
+    }
+
+    function mindDockReducer(state, action) {
+      switch (action.type) {
+        case "RESET": {
+          return createInitialState();
+        }
+
+        case "DROP": {
+          const text = (action.text || "").trim();
+          if (!text) return state;
+
+          const { lane, prepNote } = inferLaneAndPrep(text);
+          const dockedInLane = state.items.filter(
+            (i) => i.lane === lane && i.status === "docked"
+          );
+
+          const hasBerth = dockedInLane.length < state.maxBerths;
+          const newStatus = hasBerth ? "docked" : "queued";
+
+          const newItem = {
+            id: "item-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6),
+            raw: text,
+            lane,
+            status: newStatus,
+            prep: prepNote,
+            createdAt: "刚刚"
+          };
+
+          let explanation = "";
+          if (lane !== state.activeContext) {
+            explanation =
+              lane === "life"
+                ? `已闪投「${text}」→ 识别为【生活事项】，当前你在工位，已静默隐身并后台备料，下班切到手机锁屏时自动接住你。`
+                : `已闪投「${text}」→ 识别为【工作灵感】，当前你在休息/外出，已静默隐身并连夜备料，回工位亮屏时自动迎上来。`;
+          } else if (!hasBerth) {
+            explanation =
+              `泊位已满（硬上限 ${state.maxBerths} 个防焦虑）！「${text}」已进入候补备料区，办结台面任一事项后自动补位入坞。`;
+          } else {
+            explanation = `已闪投「${text}」→ 停入当前 ${lane === "work" ? "工位" : "锁屏"} 泊位，并完成幕后备料。`;
+          }
+
+          return {
+            ...state,
+            spotlightIndex: 0,
+            lastExplanation: explanation,
+            items: [newItem, ...state.items]
+          };
+        }
+
+        case "SHIFT": {
+          const target = action.context === "life" ? "life" : "work";
+          if (target === state.activeContext) return state;
+
+          const visibleCount = state.items.filter(
+            (i) => i.lane === target && i.status === "docked"
+          ).length;
+
+          const explanation =
+            target === "life"
+              ? `换场 → 检测到电脑锁屏离席：工位事项全部隐身；白天随口丢的 ${visibleCount} 件生活事已自动浮上【手机锁屏】接住你！`
+              : `换场 → 检测到工位电脑唤醒：手机锁屏清空生活打扰；昨晚路上的工作灵感已带着【幕后备料】停在电脑边角等你！`;
+
+          return {
+            ...state,
+            activeContext: target,
+            spotlightIndex: 0,
+            lastExplanation: explanation
+          };
+        }
+
+        case "RESOLVE_BERTH": {
+          const targetItem = state.items.find((i) => i.id === action.id);
+          if (!targetItem) return state;
+
+          let promotedTitle = null;
+          let promotedDone = false;
+
+          const updated = state.items.map((item) => {
+            if (item.id === action.id) {
+              return { ...item, status: "deep" };
+            }
+            if (!promotedDone && item.lane === targetItem.lane && item.status === "queued") {
+              promotedDone = true;
+              promotedTitle = item.raw;
+              return { ...item, status: "docked" };
+            }
+            return item;
+          });
+
+          const explanation = promotedTitle
+            ? `已办结「${targetItem.raw}」并沉入深海（Deep）！候补区的「${promotedTitle}」自动递补进入空出的泊位。`
+            : `已办结「${targetItem.raw}」→ 释放泊位并沉入深海（Deep），日后随时可凭模糊印象打捞。`;
+
+          return {
+            ...state,
+            spotlightIndex: 0,
+            lastExplanation: explanation,
+            items: updated
+          };
+        }
+
+        case "NEXT_SPOTLIGHT": {
+          const activeList = selectVisibleDock(state);
+          if (activeList.length === 0) return state;
+          return {
+            ...state,
+            spotlightIndex: (state.spotlightIndex + 1) % activeList.length,
+            lastExplanation: "切换聚光灯焦点至下一个泊位（始终保持视线里只有 1 件事）。"
+          };
+        }
+
+        case "SET_RECALL_QUERY": {
+          return {
+            ...state,
+            recallQuery: action.query || ""
+          };
+        }
+
+        case "RESURFACE_FROM_DEEP": {
+          const target = state.items.find((i) => i.id === action.id);
+          if (!target) return state;
+          const dockedInContext = state.items.filter(
+            (i) => i.lane === state.activeContext && i.status === "docked"
+          );
+          const nextStatus = dockedInContext.length < state.maxBerths ? "docked" : "queued";
+
+          return {
+            ...state,
+            items: state.items.map((i) =>
+              i.id === action.id ? { ...i, lane: state.activeContext, status: nextStatus } : i
+            ),
+            lastExplanation: `已将深海记忆「${target.raw}」重新打捞回当前停靠台！`
+          };
+        }
+
+        default:
+          return state;
+      }
+    }
+
+    function selectVisibleDock(state) {
+      return state.items.filter(
+        (i) => i.lane === state.activeContext && i.status === "docked"
+      );
+    }
+
+    function selectQueuedCount(state, lane) {
+      return state.items.filter((i) => i.lane === lane && i.status === "queued").length;
+    }
+
+    // Semantic / Impression Synonym Map for Prototype Demo
+    const IMPRESSION_SYNONYMS = [
+      ["密码", "免密", "登录", "passkey", "短信", "证书", "验证"],
+      ["车", "买保险", "续保", "车险", "保单", "人保"],
+      ["药", "感冒", "发烧", "退烧", "娃", "孩子"],
+      ["快递", "包裹", "取件", "丰巢", "生鲜"],
+      ["权限", "角色", "鉴权", "role", "策略"]
+    ];
+
+    function recallFromDeep(state, rawQuery) {
+      const deepItems = state.items.filter((i) => i.status === "deep");
+      const q = (rawQuery || "").trim().toLowerCase();
+      if (!q) return deepItems;
+
+      const expandedTerms = new Set([q]);
+      for (const cluster of IMPRESSION_SYNONYMS) {
+        if (cluster.some((word) => q.includes(word) || word.includes(q))) {
+          cluster.forEach((w) => expandedTerms.add(w));
+        }
+      }
+
+      return deepItems.filter((item) => {
+        const hay = (item.raw + " " + item.prep).toLowerCase();
+        for (const term of expandedTerms) {
+          if (term && hay.includes(term)) return true;
+        }
+        return q.split(/\s+/).some((tok) => tok && hay.includes(tok));
+      });
+    }
+  </script>
+
+  <!-- =====================================================================
+       THROWAWAY PROTOTYPE SHELL (UI Variants + Walkthroughs + Switcher)
+       ===================================================================== -->
+  <script>
+    const VARIANTS = [
+      { key: "A", name: "屏幕边缘泊位条 & 手机锁屏实景" },
+      { key: "B", name: "单点聚光灯（一次只看 1 件事，零列表焦虑）" },
+      { key: "C", name: "双生水平面（水上停靠台 + 水下模糊印象打捞）" }
+    ];
+
+    const WALKTHROUGHS = [
+      {
+        id: "day-loop",
+        title: "剧本 1：完整一天（工位 ↔ 手机锁屏双向接力）",
+        desc: "体验你在工位忙疯时随口甩生活琐事、下班在手机锁屏被接住、睡前甩工作点子明早在电脑前看到备料的全流程：",
+        steps: [
+          { label: "① 11:00 工位随口丢：周末续车险", action: { type: "DROP", text: "周末前记得给车续保，顺便看下去年保单多少钱" } },
+          { label: "② 18:30 下班合盖 → 看手机锁屏", action: { type: "SHIFT", context: "life" } },
+          { label: "③ 23:00 睡前冒出点子：权限砍掉角色表", action: { type: "DROP", text: "刚想到权限模块是不是能直接砍掉角色表改用策略？" } },
+          { label: "④ 次日 09:00 坐回电脑亮屏", action: { type: "SHIFT", context: "work" } }
+        ]
+      },
+      {
+        id: "overflow",
+        title: "剧本 2：泊位硬上限压力测试（连丢 4 件事会怎样？）",
+        desc: "验证为什么不会变成堆积如山的待办垃圾场：每个停靠台死锁最多 3 个泊位，超出自动进后台候补，办结一件递补一件：",
+        steps: [
+          { label: "① 丢工作事 #2：查 504 超时", action: { type: "DROP", text: "排查支付回调偶发 504 超时，怀疑是下游重试风暴" } },
+          { label: "② 丢工作事 #3：补齐接口限流", action: { type: "DROP", text: "给公开入坞 Webhook 加上每秒限流保护" } },
+          { label: "③ 丢第 4 件（触发泊位满载保护）", action: { type: "DROP", text: "整理开源仓库 Contributing 贡献指南" } }
+        ]
+      },
+      {
+        id: "recall",
+        title: "剧本 3：凭“模糊印象”打捞沉底记忆",
+        desc: "不记得原词也能找回：自动切到变体 C 的水下深海区，搜一句大白话“不用密码”或“买保险”，看两个月前的原话怎么浮上来：",
+        steps: [
+          { label: "① 切到水下打捞视图并搜「不用密码」", special: "DEMO_RECALL_AUTH" },
+          { label: "② 换个模糊印象搜「买保险」", special: "DEMO_RECALL_CAR" }
+        ]
+      }
+    ];
+
+    let appState = createInitialState();
+    let activeWalkthroughIdx = 0;
+    let completedStepIdx = -1;
+
+    function getCurrentVariantKey() {
+      const params = new URLSearchParams(window.location.search);
+      const v = (params.get("variant") || "A").toUpperCase();
+      return VARIANTS.some((item) => item.key === v) ? v : "A";
+    }
+
+    function setVariantKey(nextKey) {
+      const url = new URL(window.location.href);
+      url.searchParams.set("variant", nextKey);
+      window.history.replaceState({}, "", url.toString());
+      renderAll();
+    }
+
+    function cycleVariant(delta) {
+      const current = getCurrentVariantKey();
+      const idx = VARIANTS.findIndex((v) => v.key === current);
+      const next = VARIANTS[(idx + delta + VARIANTS.length) % VARIANTS.length];
+      setVariantKey(next.key);
+    }
+
+    function dispatch(action) {
+      appState = mindDockReducer(appState, action);
+      renderAll();
+    }
+
+    function escapeHtml(str) {
+      return String(str)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function renderVariantA() {
+      const visible = selectVisibleDock(appState);
+      const queuedHere = selectQueuedCount(appState, appState.activeContext);
+      const offstageLane = appState.activeContext === "work" ? "life" : "work";
+      const offstageCount = appState.items.filter(
+        (i) => i.lane === offstageLane && i.status !== "deep"
+      ).length;
+
+      if (appState.activeContext === "work") {
+        const dotsHtml = [0, 1, 2]
+          .map((idx) => `<span class="berth-dot ${idx < visible.length ? "filled work" : ""}"></span>`)
+          .join("");
+
+        const berthsHtml = [0, 1, 2]
+          .map((idx) => {
+            const item = visible[idx];
+            if (!item) {
+              return `<div class="empty-berth-slot">空闲泊位 #${idx + 1}（大脑留白）</div>`;
+            }
+            return `
+              <div class="berth-item">
+                <div class="berth-raw">${escapeHtml(item.raw)}</div>
+                <div class="berth-prep">${escapeHtml(item.prep)}</div>
+                <div class="berth-actions">
+                  <span>${escapeHtml(item.createdAt)}</span>
+                  <button class="mini-btn" data-resolve="${item.id}">✓ 办结沉底</button>
+                </div>
+              </div>
+            `;
+          })
+          .join("");
+
+        return `
+          <div class="va-desktop-sim">
+            <div class="va-ide-backdrop">
+              <div style="color:#94a3b8;font-weight:600;">macOS 工位桌面模拟 · 你正在专心写代码，没有弹窗打扰</div>
+              <div class="va-ide-window">
+                <div style="color:#38bdf8;">// auth/session.ts</div>
+                <div style="margin-top:8px;">export async function verifySession(token: string) {</div>
+                <div style="padding-left:16px;color:#cbd5e1;">// 白天顺口丢的生活琐事已自动隐身（当前后台替你挂着 ${offstageCount} 件生活事）</div>
+                <div style="padding-left:16px;color:#94a3b8;">// 点击上方「📱 离席回生活」看看下班亮起手机锁屏那一秒会发生什么 →</div>
+                <div>}</div>
+              </div>
+            </div>
+            <aside class="va-edge-dock">
+              <div>
+                <div class="va-dock-header">
+                  <div>
+                    <div style="font-size:13px;font-weight:700;">工位边角停靠条 (Work Dock)</div>
+                    <div style="font-size:11px;color:var(--text-muted);">硬上限 3 泊位 · 候补备料 ${queuedHere} 件</div>
+                  </div>
+                  <div class="berth-dots">${dotsHtml}</div>
+                </div>
+                <div class="berth-list">${berthsHtml}</div>
+              </div>
+              <div style="font-size:11.5px;color:var(--text-muted);border-top:1px solid var(--border);padding-top:10px;">
+                💤 另有 <b>${offstageCount}</b> 件生活事项静默隐身中，下班自动推送至手机锁屏。
+              </div>
+            </aside>
+          </div>
+        `;
+      } else {
+        // Life context: Phone Lock Screen simulation
+        const rowsHtml =
+          visible.length === 0
+            ? `<div style="font-size:13px;opacity:0.8;padding:10px 0;">今晚没有任何挂念的事，安心享受生活 ✨</div>`
+            : visible
+                .map(
+                  (item) => `
+                <div class="lock-row">
+                  <div class="lock-row-title">${escapeHtml(item.raw)}</div>
+                  <div class="lock-row-prep">${escapeHtml(item.prep)}</div>
+                  <button class="lock-row-btn" data-resolve="${item.id}">✓ 搞定了（从锁屏划掉）</button>
+                </div>
+              `
+                )
+                .join("");
+
+        return `
+          <div class="va-phone-stage">
+            <div class="phone-frame">
+              <div class="lock-clock">
+                <div class="lock-date">11月24日 星期二 · 未解锁状态</div>
+                <div class="lock-time">18:45</div>
+              </div>
+              <div class="lock-live-card">
+                <div class="lock-card-head">
+                  <span>🟢 MindDock · 离席生活接力</span>
+                  <span>${visible.length}/${appState.maxBerths} 泊位</span>
+                </div>
+                ${rowsHtml}
+              </div>
+              <div class="lock-bottom-shortcuts">
+                <span>🔦 手电筒</span>
+                <span style="opacity:0.65;">不用点进任何 App，看时间顺眼就接住了</span>
+                <span>🎙️ 锁屏闪投</span>
+              </div>
+            </div>
+            <div style="max-width:340px;color:#cbd5e1;font-size:13.5px;line-height:1.7;">
+              <div style="color:#fff;font-weight:700;font-size:16px;margin-bottom:8px;">为什么不用打开手机 App？</div>
+              <p>下班合上电脑后，白天你在工位随口甩的那句生活杂事，直接变成了系统原生的<b>锁屏常驻卡片（iOS Live Activity / 安卓焦点通知）</b>。</p>
+              <p style="margin-top:10px;color:#94a3b8;">同时，你现在如果在路上随口丢一句工作灵感（点上方预设试试），它<b>绝不会出现在这张锁屏卡片上烦你</b>，而是连夜备好料明早在工位等你（当前后台已备料工作事项：<b>${offstageCount}</b> 件）。</p>
+            </div>
+          </div>
+        `;
+      }
+    }
+
+    function renderVariantB() {
+      const visible = selectVisibleDock(appState);
+      const isWork = appState.activeContext === "work";
+      const currentItem = visible[appState.spotlightIndex % Math.max(visible.length, 1)];
+
+      if (!currentItem) {
+        return `
+          <div class="vb-stage">
+            <div></div>
+            <div class="vb-spotlight-card">
+              <span class="vb-kicker ${isWork ? "" : "life"}">${isWork ? "💻 工位聚光灯" : "📱 锁屏单焦点"}</span>
+              <div class="vb-hero-title">台面全空，大脑零负债</div>
+              <p style="color:var(--text-secondary);font-size:14px;">当前场景下没有需要操心的事。在顶部随口丢一句话试试。</p>
+            </div>
+            <div></div>
+          </div>
+        `;
+      }
+
+      return `
+        <div class="vb-stage">
+          <div style="font-size:12px;color:var(--text-muted);">
+            变体 B 核心理念：<b>彻底消灭“列表”</b>——哪怕停靠了 ${visible.length} 件事，眼前永远只准出现 1 件，杜绝扫视多行待办带来的焦虑。
+          </div>
+          <div class="vb-spotlight-card">
+            <span class="vb-kicker ${isWork ? "" : "life"}">
+              ${isWork ? "💻 当前工位唯一焦点" : "📱 当前生活唯一提醒"} · 泊位 ${(appState.spotlightIndex % visible.length) + 1} / ${visible.length}
+            </span>
+            <div class="vb-hero-title">${escapeHtml(currentItem.raw)}</div>
+            <div class="vb-prep-box">
+              <div style="font-size:11px;font-weight:700;color:var(--text-muted);margin-bottom:4px;">AGENT 幕后备料（已替你推进到可拍板状态）</div>
+              <div>${escapeHtml(currentItem.prep)}</div>
+            </div>
+            <div class="vb-action-row">
+              <button class="btn btn-primary" data-resolve="${currentItem.id}">✓ 拍板办结（沉入深海）</button>
+              ${
+                visible.length > 1
+                  ? `<button id="vb-next-btn" class="btn" type="button">暂放，看下一件 (${visible.length - 1}) →</button>`
+                  : ""
+              }
+            </div>
+          </div>
+          <div style="font-size:12px;color:var(--text-muted);">输入和回忆共用顶部的同一句话入口，零多余按钮</div>
+        </div>
+      `;
+    }
+
+    function renderVariantC() {
+      const visible = selectVisibleDock(appState);
+      const isWork = appState.activeContext === "work";
+      const recallHits = recallFromDeep(appState, appState.recallQuery);
+
+      const slotsHtml = [0, 1, 2]
+        .map((idx) => {
+          const item = visible[idx];
+          if (!item) {
+            return `<div class="empty-berth-slot" style="display:flex;align-items:center;justify-content:center;min-height:130px;">空泊位 #${idx + 1}</div>`;
+          }
+          return `
+            <div class="berth-item" style="display:flex;flex-direction:column;justify-content:space-between;">
+              <div>
+                <div class="berth-raw">${escapeHtml(item.raw)}</div>
+                <div class="berth-prep ${isWork ? "" : "life-prep"}">${escapeHtml(item.prep)}</div>
+              </div>
+              <div class="berth-actions">
+                <span>${escapeHtml(item.createdAt)}</span>
+                <button class="mini-btn" data-resolve="${item.id}">✓ 沉入水下</button>
+              </div>
+            </div>
+          `;
+        })
+        .join("");
+
+      const hitsHtml =
+        recallHits.length === 0
+          ? `<div style="font-size:13px;color:#64748b;padding:8px 0;">水下暂无匹配这条模糊印象的记录（试试搜“不用密码”或“买保险”）</div>`
+          : recallHits
+              .map(
+                (item) => `
+              <div class="recall-hit">
+                <div>
+                  <div style="color:#f8fafc;font-weight:600;">${escapeHtml(item.raw)}</div>
+                  <div style="font-size:12px;color:#94a3b8;margin-top:2px;">${escapeHtml(item.prep)} · <span>${escapeHtml(item.createdAt)}</span></div>
+                </div>
+                <button class="mini-btn" data-resurface="${item.id}">↑ 捞回台面</button>
+              </div>
+            `
+              )
+              .join("");
+
+      return `
+        <div class="vc-stage">
+          <div class="vc-above-water">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <div>
+                <span style="font-size:15px;font-weight:700;">🌊 水面之上：当前${isWork ? "工位" : "生活"}停靠台（最多 3 艘活船）</span>
+                <span style="font-size:12px;color:var(--text-muted);margin-left:8px;">适合作为浏览器 Cmd+T 新标签页</span>
+              </div>
+              <span style="font-size:12px;font-weight:600;color:${isWork ? "var(--accent)" : "var(--life)"};">
+                当前场景：${isWork ? "💻 在工位" : "📱 离席生活"}
+              </span>
+            </div>
+            <div class="vc-berth-grid">${slotsHtml}</div>
+          </div>
+
+          <div class="vc-waterline">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+              <span style="font-size:13px;font-weight:700;color:#e2e8f0;">⚓ 水面之下：深海记忆层（The Deep · 平时隐身，凭模糊印象打捞）</span>
+              <span style="font-size:12px;color:#94a3b8;">共沉淀 ${appState.items.filter((i) => i.status === "deep").length} 条历史记忆</span>
+            </div>
+            <div class="recall-bar">
+              <input id="recall-input" class="recall-input" type="text" value="${escapeHtml(appState.recallQuery)}" placeholder="凭模糊印象打捞水下记忆（不用精确原词，试试输入：不用密码 / 买保险）..." />
+            </div>
+            <div class="recall-results">${hitsHtml}</div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderWalkthroughs() {
+      const tabsEl = document.getElementById("wt-tabs");
+      const descEl = document.getElementById("wt-desc");
+      const stepsEl = document.getElementById("wt-steps");
+
+      tabsEl.innerHTML = WALKTHROUGHS.map(
+        (wt, idx) =>
+          `<button class="wt-tab ${idx === activeWalkthroughIdx ? "active" : ""}" data-wt-idx="${idx}">${escapeHtml(wt.title)}</button>`
+      ).join("");
+
+      const currentWt = WALKTHROUGHS[activeWalkthroughIdx];
+      descEl.textContent = currentWt.desc;
+
+      stepsEl.innerHTML = currentWt.steps
+        .map((st, sIdx) => {
+          let cls = "wt-step-btn";
+          if (sIdx === completedStepIdx + 1) cls += " next-step";
+          if (sIdx <= completedStepIdx) cls += " done-step";
+          return `<button class="${cls}" data-step-idx="${sIdx}">${escapeHtml(st.label)}</button>`;
+        })
+        .join("");
+    }
+
+    function renderInspector() {
+      const workDocked = appState.items.filter((i) => i.lane === "work" && i.status === "docked").length;
+      const workQueued = selectQueuedCount(appState, "work");
+      const lifeDocked = appState.items.filter((i) => i.lane === "life" && i.status === "docked").length;
+      const lifeQueued = selectQueuedCount(appState, "life");
+      const deepCount = appState.items.filter((i) => i.status === "deep").length;
+
+      document.getElementById("inspector-grid").innerHTML = `
+        <div class="stat-box">
+          <div style="color:var(--text-muted);font-size:11px;">当前激活表层 (Active Context)</div>
+          <div class="stat-num" style="color:${appState.activeContext === "work" ? "var(--accent)" : "var(--life)"};">
+            ${appState.activeContext === "work" ? "💻 工位桌面边角" : "📱 手机锁屏卡片"}
+          </div>
+        </div>
+        <div class="stat-box">
+          <div style="color:var(--text-muted);font-size:11px;">工位泊位占用 (Work Berths)</div>
+          <div class="stat-num">${workDocked} / ${appState.maxBerths} <span style="font-size:12px;font-weight:400;color:var(--text-secondary);">（候补 ${workQueued}）</span></div>
+        </div>
+        <div class="stat-box">
+          <div style="color:var(--text-muted);font-size:11px;">锁屏泊位占用 (Life Berths)</div>
+          <div class="stat-num">${lifeDocked} / ${appState.maxBerths} <span style="font-size:12px;font-weight:400;color:var(--text-secondary);">（候补 ${lifeQueued}）</span></div>
+        </div>
+        <div class="stat-box">
+          <div style="color:var(--text-muted);font-size:11px;">深海无压归档 (Deep Memory)</div>
+          <div class="stat-num">${deepCount} 条 <span style="font-size:12px;font-weight:400;color:var(--text-secondary);">（水下隐身）</span></div>
+        </div>
+      `;
+    }
+
+    function renderAll() {
+      const vKey = getCurrentVariantKey();
+      const vMeta = VARIANTS.find((v) => v.key === vKey) || VARIANTS[0];
+
+      document.getElementById("variant-label").textContent = `${vMeta.key} (${vMeta.name})`;
+      document.getElementById("last-event").textContent = appState.lastExplanation;
+
+      document.getElementById("shift-work").classList.toggle("active", appState.activeContext === "work");
+      document.getElementById("shift-life").classList.toggle("active", appState.activeContext === "life");
+
+      renderWalkthroughs();
+      renderInspector();
+
+      const stage = document.getElementById("variant-stage");
+      const recallWasFocused = document.activeElement && document.activeElement.id === "recall-input";
+      const caretPos = recallWasFocused ? document.activeElement.selectionStart : null;
+
+      if (vKey === "A") stage.innerHTML = renderVariantA();
+      else if (vKey === "B") stage.innerHTML = renderVariantB();
+      else stage.innerHTML = renderVariantC();
+
+      if (recallWasFocused && vKey === "C") {
+        const input = document.getElementById("recall-input");
+        if (input) {
+          input.focus();
+          if (caretPos !== null) input.setSelectionRange(caretPos, caretPos);
+        }
+      }
+    }
+
+    // Event Delegation & Bindings
+    document.getElementById("drop-submit").addEventListener("click", () => {
+      const input = document.getElementById("drop-input");
+      if (!input.value.trim()) return;
+      dispatch({ type: "DROP", text: input.value });
+      input.value = "";
+    });
+
+    document.getElementById("drop-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        document.getElementById("drop-submit").click();
+      }
+    });
+
+    document.querySelectorAll("[data-drop]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        dispatch({ type: "DROP", text: btn.getAttribute("data-drop") });
+      });
+    });
+
+    document.getElementById("shift-work").addEventListener("click", () => {
+      dispatch({ type: "SHIFT", context: "work" });
+    });
+
+    document.getElementById("shift-life").addEventListener("click", () => {
+      dispatch({ type: "SHIFT", context: "life" });
+    });
+
+    document.getElementById("reset-demo").addEventListener("click", () => {
+      completedStepIdx = -1;
+      dispatch({ type: "RESET" });
+    });
+
+    document.getElementById("wt-tabs").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-wt-idx]");
+      if (!btn) return;
+      activeWalkthroughIdx = Number(btn.getAttribute("data-wt-idx"));
+      completedStepIdx = -1;
+      dispatch({ type: "RESET" });
+    });
+
+    document.getElementById("wt-steps").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-step-idx]");
+      if (!btn) return;
+      const sIdx = Number(btn.getAttribute("data-step-idx"));
+      const step = WALKTHROUGHS[activeWalkthroughIdx].steps[sIdx];
+      completedStepIdx = sIdx;
+
+      if (step.special === "DEMO_RECALL_AUTH") {
+        appState = mindDockReducer(appState, { type: "SET_RECALL_QUERY", query: "不用密码" });
+        appState.lastExplanation = "模糊印象打捞演示：你搜的是「不用密码」，虽然原话写的是「扫码签发短期设备证书 / Passkey」，语义簇依然精准捞出！";
+        setVariantKey("C");
+      } else if (step.special === "DEMO_RECALL_CAR") {
+        appState = mindDockReducer(appState, { type: "SET_RECALL_QUERY", query: "买保险" });
+        appState.lastExplanation = "模糊印象打捞演示：你搜的是「买保险」，自动捞出 11 个月前办结沉底的「人保 ¥3,420 小陈」记录！";
+        setVariantKey("C");
+      } else if (step.action) {
+        dispatch(step.action);
+      }
+    });
+
+    document.getElementById("variant-stage").addEventListener("click", (e) => {
+      const resolveBtn = e.target.closest("[data-resolve]");
+      if (resolveBtn) {
+        dispatch({ type: "RESOLVE_BERTH", id: resolveBtn.getAttribute("data-resolve") });
+        return;
+      }
+      const resurfaceBtn = e.target.closest("[data-resurface]");
+      if (resurfaceBtn) {
+        dispatch({ type: "RESURFACE_FROM_DEEP", id: resurfaceBtn.getAttribute("data-resurface") });
+        return;
+      }
+      if (e.target.closest("#vb-next-btn")) {
+        dispatch({ type: "NEXT_SPOTLIGHT" });
+      }
+    });
+
+    document.getElementById("variant-stage").addEventListener("input", (e) => {
+      if (e.target.id === "recall-input") {
+        dispatch({ type: "SET_RECALL_QUERY", query: e.target.value });
+      }
+    });
+
+    document.getElementById("prev-variant").addEventListener("click", () => cycleVariant(-1));
+    document.getElementById("next-variant").addEventListener("click", () => cycleVariant(1));
+
+    // Keyboard navigation (UI.md rule: don't intercept arrows when input/textarea focused)
+    window.addEventListener("keydown", (e) => {
+      const tag = (document.activeElement && document.activeElement.tagName) || "";
+      const isEditing = tag === "INPUT" || tag === "TEXTAREA" || (document.activeElement && document.activeElement.isContentEditable);
+
+      if (!isEditing && e.key === "/") {
+        e.preventDefault();
+        document.getElementById("drop-input").focus();
+      } else if (!isEditing && e.key === "ArrowLeft") {
+        e.preventDefault();
+        cycleVariant(-1);
+      } else if (!isEditing && e.key === "ArrowRight") {
+        e.preventDefault();
+        cycleVariant(1);
+      }
+    });
+
+    // Optional Browser Speech Recognition for true hands-free Drop feel
+    const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const voiceBtn = document.getElementById("voice-btn");
+    if (!SpeechRec) {
+      document.getElementById("mic-hint").textContent = "当前浏览器不支持语音API，可键盘输入";
+      voiceBtn.style.display = "none";
+    } else {
+      const recognition = new SpeechRec();
+      recognition.lang = "zh-CN";
+      recognition.interimResults = false;
+      let isRecording = false;
+
+      voiceBtn.addEventListener("click", () => {
+        if (isRecording) {
+          recognition.stop();
+          return;
+        }
+        recognition.start();
+      });
+
+      recognition.onstart = () => {
+        isRecording = true;
+        voiceBtn.classList.add("recording");
+        voiceBtn.textContent = "⏹ 说完点停...";
+      };
+
+      recognition.onresult = (event) => {
+        const transcript = event.results[0][0].transcript;
+        if (transcript) {
+          dispatch({ type: "DROP", text: transcript });
+        }
+      };
+
+      recognition.onend = () => {
+        isRecording = false;
+        voiceBtn.classList.remove("recording");
+        voiceBtn.textContent = "🎙️ 说一句";
+      };
+    }
+
+    renderAll();
+  </script>
+</body>
+</html>
