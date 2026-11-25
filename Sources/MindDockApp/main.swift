@@ -15,7 +15,33 @@ private func runSmokeCheck() throws {
     guard vm.submitDraftDrop(), vm.snapshot.berths.count == 1 else {
         throw DockError.storageFailure("MindDockApp smoke check failed")
     }
-    print("MindDockApp smoke check passed (1/3 Berths active)")
+
+    // Verify SystemShiftMonitor responds to screen lock/unlock and sleep/wake notifications cleanly
+    let fakeDistributed = NotificationCenter()
+    let fakeWorkspace = NotificationCenter()
+    let monitor = SystemShiftMonitor(
+        distributedCenter: fakeDistributed,
+        workspaceCenter: fakeWorkspace,
+        syncInterval: 60.0,
+        onDeparture: { _ in vm.handleSystemDeparture() },
+        onArrival: { _ in vm.handleSystemArrival() },
+        onPeriodicSync: { vm.syncMobileBridgeInBackground() }
+    )
+    monitor.start()
+    fakeDistributed.post(name: SystemShiftMonitor.screenIsLockedNotification, object: nil)
+    guard vm.snapshot.activeLane == .life, !monitor.isAwakeAndUnlocked else {
+        throw DockError.storageFailure("SystemShiftMonitor failed to shift to Life on screenIsLocked")
+    }
+    fakeWorkspace.post(name: NSWorkspace.didWakeNotification, object: nil)
+    guard vm.snapshot.activeLane == .work, monitor.isAwakeAndUnlocked else {
+        throw DockError.storageFailure("SystemShiftMonitor failed to shift to Work on didWake")
+    }
+    monitor.stop()
+    guard !monitor.isRunning else {
+        throw DockError.storageFailure("SystemShiftMonitor failed to stop cleanly")
+    }
+
+    print("MindDockApp smoke check passed (1/3 Berths active, SystemShiftMonitor verified)")
 }
 
 MainActor.assumeIsolated {

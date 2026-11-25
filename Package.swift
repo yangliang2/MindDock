@@ -24,7 +24,8 @@ let package = Package(
         .target(
             name: "MindDockCore",
             linkerSettings: [
-                .linkedLibrary("sqlite3")
+                .linkedLibrary("sqlite3"),
+                .linkedFramework("Speech")
             ]
         ),
         .executableTarget(

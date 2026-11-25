@@ -32,6 +32,18 @@ func expectTrue(
     }
 }
 
+func expectUnwrap<T>(
+    _ value: T?,
+    _ message: String,
+    file: String = #fileID,
+    line: Int = #line
+) throws -> T {
+    guard let value else {
+        throw TestFailure(message, file: file, line: line)
+    }
+    return value
+}
+
 func withTempDatabasePath<T>(_ body: (String) throws -> T) throws -> T {
     let dir = FileManager.default.temporaryDirectory
         .appendingPathComponent("MindDockTests-\(UUID().uuidString)", isDirectory: true)
@@ -41,9 +53,178 @@ func withTempDatabasePath<T>(_ body: (String) throws -> T) throws -> T {
     return try body(dbPath)
 }
 
+func withTempDatabasePathAsync<T>(_ body: (String) async throws -> T) async throws -> T {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("MindDockTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let dbPath = dir.appendingPathComponent("minddock.sqlite3").path
+    return try await body(dbPath)
+}
+
 struct TestCase: Sendable {
     let name: String
     let run: @Sendable () throws -> Void
+}
+
+func runAsyncTest(_ block: @escaping @Sendable () async throws -> Void) throws {
+    final class Box: @unchecked Sendable {
+        var result: Result<Void, Error>?
+    }
+    let box = Box()
+    let semaphore = DispatchSemaphore(value: 0)
+    Task {
+        do {
+            try await block()
+            box.result = .success(())
+        } catch {
+            box.result = .failure(error)
+        }
+        semaphore.signal()
+    }
+    semaphore.wait()
+    if case .failure(let error) = box.result {
+        throw error
+    }
+}
+
+final class FakeMobileBridgeClient: MobileBridgeClient, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var pushedPayloads: [LifeDockPushPayload] = []
+    private(set) var pullCursorsReceived: [String?] = []
+    var queuedBatches: [InboundMessageBatch] = []
+    var failNextPushError: Error?
+
+    func pushLifeDock(_ payload: LifeDockPushPayload) async throws {
+        try lock.withLock {
+            if let err = failNextPushError {
+                failNextPushError = nil
+                throw err
+            }
+            pushedPayloads.append(payload)
+        }
+    }
+
+    func pullMessages(sinceCursor: String?) async throws -> InboundMessageBatch {
+        lock.withLock {
+            pullCursorsReceived.append(sinceCursor)
+            if !queuedBatches.isEmpty {
+                return queuedBatches.removeFirst()
+            }
+            return InboundMessageBatch(messages: [], nextCursor: sinceCursor)
+        }
+    }
+}
+
+final class FakeAudioTranscriber: AudioTranscriber, @unchecked Sendable {
+    private let lock = NSLock()
+    private(set) var receivedClips: [(Data, String)] = []
+    var stubbedTranscript: String
+
+    init(stubbedTranscript: String) {
+        self.stubbedTranscript = stubbedTranscript
+    }
+
+    func transcribe(audioData: Data, fileExtension: String) async throws -> String {
+        lock.withLock {
+            receivedClips.append((audioData, fileExtension))
+            return stubbedTranscript
+        }
+    }
+}
+
+struct CapturedHTTPRequest: Sendable {
+    let method: String
+    let url: URL
+    let headers: [String: String]
+    let body: Data
+}
+
+final class StubURLProtocol: URLProtocol, @unchecked Sendable {
+    private final class StateBox: @unchecked Sendable {
+        let lock = NSLock()
+        var handler: (@Sendable (CapturedHTTPRequest) throws -> (Int, [String: String], Data))?
+        var capturedRequests: [CapturedHTTPRequest] = []
+    }
+    private static let state = StateBox()
+
+    static func install(
+        _ newHandler: @escaping @Sendable (CapturedHTTPRequest) throws -> (Int, [String: String], Data)
+    ) {
+        state.lock.withLock {
+            state.capturedRequests = []
+            state.handler = newHandler
+        }
+    }
+
+    static func requests() -> [CapturedHTTPRequest] {
+        state.lock.withLock { state.capturedRequests }
+    }
+
+    static func makeSession() -> URLSession {
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [StubURLProtocol.self]
+        return URLSession(configuration: config)
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        true
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        var bodyData = request.httpBody ?? Data()
+        if bodyData.isEmpty, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let readCount = stream.read(&buffer, maxLength: buffer.count)
+                if readCount > 0 {
+                    bodyData.append(buffer, count: readCount)
+                } else {
+                    break
+                }
+            }
+        }
+
+        let captured = CapturedHTTPRequest(
+            method: request.httpMethod ?? "GET",
+            url: request.url ?? URL(string: "https://invalid.local")!,
+            headers: request.allHTTPHeaderFields ?? [:],
+            body: bodyData
+        )
+
+        let activeHandler = Self.state.lock.withLock { () -> (@Sendable (CapturedHTTPRequest) throws -> (Int, [String: String], Data))? in
+            Self.state.capturedRequests.append(captured)
+            return Self.state.handler
+        }
+
+        guard let activeHandler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+
+        do {
+            let (statusCode, headers, responseBody) = try activeHandler(captured)
+            let response = HTTPURLResponse(
+                url: captured.url,
+                statusCode: statusCode,
+                httpVersion: "HTTP/1.1",
+                headerFields: headers
+            )!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: responseBody)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
 }
 
 let allTests: [TestCase] = [
@@ -273,6 +454,635 @@ let allTests: [TestCase] = [
 
             let deepAfterRestart = try reopenedEngine.deepItems()
             try expectEqual(deepAfterRestart.count, 2)
+        }
+    },
+    TestCase(name: "departure_shift_to_life_pushes_numbered_berths_with_prep_notes_and_skips_when_empty") {
+        try runAsyncTest {
+            try await withTempDatabasePathAsync { dbPath in
+                let bridge = FakeMobileBridgeClient()
+                let engine = try DockEngine(databasePath: dbPath, mobileBridge: bridge)
+
+                // Shifting to Life when 0 Life Berths exist must shift lane without spamming phone
+                let emptyShift = try await engine.shiftAndSync(to: .life)
+                try expectEqual(emptyShift.snapshot.activeLane, .life)
+                try expectEqual(emptyShift.pushedLifeDock, false)
+                try expectEqual(bridge.pushedPayloads.count, 0)
+
+                // Back at Work, capture 4 Life Drops and attach Prep notes to active ones
+                _ = try engine.shift(to: .work)
+                let sacredL1 = "下班去丰巢取冷链快递 #A92"
+                let l1 = try engine.drop(sacredL1, lane: .life)
+                let l2 = try engine.drop("买儿童退烧贴", lane: .life)
+                let l3 = try engine.drop("周末车险续保比价", lane: .life)
+                _ = try engine.drop("预约洗牙（排队的第 4 项）", lane: .life)
+
+                let preppedL1 = try engine.attachPrep(id: l1.id, prep: "取件码检查短信；生鲜需 21:00 前拿回冰箱")
+                try expectEqual(preppedL1.raw, sacredL1, "attachPrep must never mutate raw text")
+                try expectEqual(preppedL1.prep, "取件码检查短信；生鲜需 21:00 前拿回冰箱")
+                try expectEqual(preppedL1.prepState, .ready)
+                _ = try engine.attachPrep(id: l2.id, prep: "24h 药店就在小区南门")
+
+                // Departure Shift to Life pushes the 3 active Life Berths numbered 1..3 + queued count
+                let departure = try await engine.shiftAndSync(to: .life)
+                try expectEqual(departure.snapshot.activeLane, .life)
+                try expectEqual(departure.pushedLifeDock, true)
+                try expectEqual(bridge.pushedPayloads.count, 1)
+
+                let payload = bridge.pushedPayloads[0]
+                try expectEqual(payload.queuedCount, 1)
+                try expectEqual(payload.berths, [
+                    LifeDockPushBerth(
+                        slotNumber: 1,
+                        id: l1.id,
+                        raw: sacredL1,
+                        prep: "取件码检查短信；生鲜需 21:00 前拿回冰箱"
+                    ),
+                    LifeDockPushBerth(
+                        slotNumber: 2,
+                        id: l2.id,
+                        raw: "买儿童退烧贴",
+                        prep: "24h 药店就在小区南门"
+                    ),
+                    LifeDockPushBerth(
+                        slotNumber: 3,
+                        id: l3.id,
+                        raw: "周末车险续保比价",
+                        prep: nil
+                    )
+                ])
+            }
+        }
+    },
+    TestCase(name: "departure_shift_deduplicates_unchanged_life_dock_across_repeated_locks_and_restarts") {
+        try runAsyncTest {
+            try await withTempDatabasePathAsync { dbPath in
+                let bridge = FakeMobileBridgeClient()
+                let l1Id: String
+                do {
+                    let engine = try DockEngine(databasePath: dbPath, mobileBridge: bridge)
+                    let l1 = try engine.drop("下班买牛奶", lane: .life)
+                    l1Id = l1.id
+
+                    // Transient failure must NOT mark fingerprint as pushed
+                    bridge.failNextPushError = URLError(.notConnectedToInternet)
+                    var threwOnTransient = false
+                    do {
+                        _ = try await engine.shiftAndSync(to: .life)
+                    } catch {
+                        threwOnTransient = true
+                    }
+                    try expectTrue(threwOnTransient, "Transient push error should propagate")
+                    try expectEqual(bridge.pushedPayloads.count, 0)
+
+                    // Retry succeeds and records fingerprint
+                    let firstPush = try await engine.shiftAndSync(to: .life)
+                    try expectEqual(firstPush.pushedLifeDock, true)
+                    try expectEqual(bridge.pushedPayloads.count, 1)
+
+                    // Immediate second signal (e.g. lock followed by sleep) must NOT duplicate push
+                    let duplicateSleep = try await engine.shiftAndSync(to: .life)
+                    try expectEqual(duplicateSleep.pushedLifeDock, false)
+                    try expectEqual(bridge.pushedPayloads.count, 1)
+                }
+
+                // Re-instantiate DockEngine on same SQLite file: unchanged Life Dock still deduplicated
+                let reopened = try DockEngine(databasePath: dbPath, mobileBridge: bridge)
+                let afterRestart = try await reopened.shiftAndSync(to: .life)
+                try expectEqual(afterRestart.pushedLifeDock, false, "Persisted SQLite fingerprint must prevent duplicate push after restart")
+                try expectEqual(bridge.pushedPayloads.count, 1)
+
+                // Enriching Prep or adding a Berth changes fingerprint and triggers a fresh push
+                _ = try reopened.attachPrep(id: l1Id, prep: "盒马鲜生全脂牛奶 950ml")
+                let afterPrepChange = try await reopened.shiftAndSync(to: .life)
+                try expectEqual(afterPrepChange.pushedLifeDock, true)
+                try expectEqual(bridge.pushedPayloads.count, 2)
+                try expectEqual(bridge.pushedPayloads[1].berths[0].prep, "盒马鲜生全脂牛奶 950ml")
+            }
+        }
+    },
+    TestCase(name: "arrival_shift_pulls_unread_messages_ignores_bot_echoes_advances_cursor_and_docks_drops_with_prep") {
+        try runAsyncTest {
+            try await withTempDatabasePathAsync { dbPath in
+                let bridge = FakeMobileBridgeClient()
+                let sacredWorkDrop = "  明早先排查 webhook 幂等锁偶发死锁问题  "
+                bridge.queuedBatches = [
+                    InboundMessageBatch(
+                        messages: [
+                            InboundMobileMessage(
+                                messageId: "om_bot_card_1",
+                                senderRole: .bot,
+                                kind: .text,
+                                text: "MindDock Life Dock: 1. 下班买牛奶",
+                                createdAtTimestamp: "1732520000100"
+                            ),
+                            InboundMobileMessage(
+                                messageId: "om_user_1",
+                                senderRole: .user,
+                                kind: .text,
+                                text: sacredWorkDrop,
+                                createdAtTimestamp: "1732520001500"
+                            ),
+                            InboundMobileMessage(
+                                messageId: "om_user_2",
+                                senderRole: .user,
+                                kind: .text,
+                                text: "周末带爸妈去医院拿体检报告",
+                                createdAtTimestamp: "1732520002800"
+                            )
+                        ],
+                        nextCursor: "1732520002800#om_user_2"
+                    ),
+                    InboundMessageBatch(
+                        messages: [
+                            // Boundary replay of om_user_2 must be ignored idempotently
+                            InboundMobileMessage(
+                                messageId: "om_user_2",
+                                senderRole: .user,
+                                kind: .text,
+                                text: "周末带爸妈去医院拿体检报告",
+                                createdAtTimestamp: "1732520002800"
+                            ),
+                            InboundMobileMessage(
+                                messageId: "om_user_3",
+                                senderRole: .user,
+                                kind: .text,
+                                text: "补齐 SQLite busy_timeout 配置",
+                                createdAtTimestamp: "1732520009000"
+                            )
+                        ],
+                        nextCursor: "1732520009000#om_user_3"
+                    )
+                ]
+
+                do {
+                    let engine = try DockEngine(databasePath: dbPath, mobileBridge: bridge)
+                    _ = try engine.shift(to: .life)
+
+                    let arrival = try await engine.shiftAndSync(to: .work)
+                    try expectEqual(arrival.snapshot.activeLane, .work)
+                    try expectEqual(arrival.pushedLifeDock, false)
+                    try expectEqual(bridge.pullCursorsReceived, [nil])
+                    try expectEqual(arrival.syncReport?.droppedItems.count, 2)
+                    try expectEqual(arrival.syncReport?.advancedCursor, "1732520002800#om_user_2")
+
+                    // Bot message ignored; Work Drop is on Work Dock with verbatim raw + Prep
+                    try expectEqual(arrival.snapshot.berths.count, 1)
+                    try expectEqual(arrival.snapshot.berths[0].raw, sacredWorkDrop)
+                    try expectEqual(arrival.snapshot.berths[0].prepState, .ready)
+                    try expectTrue(
+                        !(arrival.snapshot.berths[0].prep ?? "").isEmpty,
+                        "Mobile-ingested Drop must receive automatic Prep note"
+                    )
+
+                    // Life Drop routed off-stage onto Life Dock with Prep
+                    let lifeDock = try engine.getDock(lane: .life)
+                    try expectEqual(lifeDock.berths.map(\.raw), ["周末带爸妈去医院拿体检报告"])
+                    try expectEqual(lifeDock.berths[0].prepState, .ready)
+                }
+
+                // Reopen engine on same SQLite DB: periodic sync must use persisted cursor & skip replayed messageId
+                let reopened = try DockEngine(databasePath: dbPath, mobileBridge: bridge)
+                let secondSync = try await reopened.syncMobileBridge()
+                try expectEqual(bridge.pullCursorsReceived, [nil, "1732520002800#om_user_2"])
+                try expectEqual(secondSync.droppedItems.map(\.raw), ["补齐 SQLite busy_timeout 配置"])
+                try expectEqual(secondSync.advancedCursor, "1732520009000#om_user_3")
+
+                let workDock = try reopened.getDock(lane: .work)
+                try expectEqual(workDock.berths.map(\.raw), [sacredWorkDrop, "补齐 SQLite busy_timeout 配置"])
+            }
+        }
+    },
+    TestCase(name: "inbound_sync_executes_quick_completion_replies_and_transcribes_audio_drops") {
+        try runAsyncTest {
+            try await withTempDatabasePathAsync { dbPath in
+                let bridge = FakeMobileBridgeClient()
+                let transcriber = FakeAudioTranscriber(stubbedTranscript: "下班顺便去药店买创可贴")
+                let engine = try DockEngine(
+                    databasePath: dbPath,
+                    mobileBridge: bridge,
+                    audioTranscriber: transcriber
+                )
+
+                let l1 = try engine.drop("L1: 取丰巢生鲜快递", lane: .life)
+                let l2 = try engine.drop("L2: 买儿童退烧贴", lane: .life)
+                _ = try engine.drop("L3: 周末车险续保", lane: .life)
+                let l4 = try engine.drop("L4: 预约牙医洗牙（候补队列）", lane: .life)
+
+                _ = try await engine.shiftAndSync(to: .life)
+
+                let fakeOpusBytes = Data([0x4F, 0x67, 0x67, 0x53, 0x00, 0x02])
+                bridge.queuedBatches = [
+                    InboundMessageBatch(
+                        messages: [
+                            InboundMobileMessage(
+                                messageId: "om_reply_1",
+                                senderRole: .user,
+                                kind: .text,
+                                text: "done 1",
+                                createdAtTimestamp: "1732530001000"
+                            ),
+                            InboundMobileMessage(
+                                messageId: "om_reply_2",
+                                senderRole: .user,
+                                kind: .text,
+                                text: "搞定 2",
+                                createdAtTimestamp: "1732530002000"
+                            ),
+                            InboundMobileMessage(
+                                messageId: "om_real_work_sentence",
+                                senderRole: .user,
+                                kind: .text,
+                                text: "明天完成 1 号接口压测报告",
+                                createdAtTimestamp: "1732530003000"
+                            ),
+                            InboundMobileMessage(
+                                messageId: "om_voice_1",
+                                senderRole: .user,
+                                kind: .audio,
+                                text: "",
+                                audioData: fakeOpusBytes,
+                                audioFileExtension: "opus",
+                                createdAtTimestamp: "1732530004000"
+                            )
+                        ],
+                        nextCursor: "1732530004000#om_voice_1"
+                    )
+                ]
+
+                let arrival = try await engine.shiftAndSync(to: .work)
+                let report = try expectUnwrap(arrival.syncReport, "Expected syncReport on arrival")
+
+                // L1 and L2 resolved; L4 promoted via FIFO; audio transcribed into new Life Drop (docked in 3rd slot!)
+                try expectEqual(report.resolvedItems.map(\.sunkItem.id), [l1.id, l2.id])
+                try expectEqual(report.resolvedItems[0].promotedItem?.id, l4.id)
+
+                // Sentence containing "完成 1" inside natural language is docked as Work Drop, NOT treated as command
+                try expectEqual(arrival.snapshot.berths.map(\.raw), ["明天完成 1 号接口压测报告"])
+
+                // Audio clip transcribed via hook and docked onto Life lane with Prep
+                try expectEqual(transcriber.receivedClips.count, 1)
+                try expectEqual(transcriber.receivedClips[0].0, fakeOpusBytes)
+                try expectEqual(transcriber.receivedClips[0].1, "opus")
+
+                let lifeDock = try engine.getDock(lane: .life)
+                try expectEqual(lifeDock.berths.map(\.raw), [
+                    "L3: 周末车险续保",
+                    "L4: 预约牙医洗牙（候补队列）",
+                    "下班顺便去药店买创可贴"
+                ])
+                try expectEqual(lifeDock.berths[2].prepState, .ready)
+
+                let deepLife = try engine.deepItems(lane: .life)
+                try expectEqual(Set(deepLife.map(\.id)), Set([l1.id, l2.id]))
+            }
+        }
+    },
+    TestCase(name: "feishu_bridge_formats_lock_screen_card_for_webhook_and_app_bot_rest") {
+        try runAsyncTest {
+            let samplePayload = LifeDockPushPayload(
+                berths: [
+                    LifeDockPushBerth(
+                        slotNumber: 1,
+                        id: "b1",
+                        raw: "下班去丰巢取冷链快递",
+                        prep: "取件码 8821，21:00 前回家"
+                    ),
+                    LifeDockPushBerth(
+                        slotNumber: 2,
+                        id: "b2",
+                        raw: "买儿童退烧贴",
+                        prep: nil
+                    )
+                ],
+                queuedCount: 1,
+                fingerprint: "fp-demo-1"
+            )
+
+            // 1. Outbound 1-line Feishu Custom Bot Webhook
+            StubURLProtocol.install { req in
+                let ok = #"{"code":0,"msg":"success"}"#.data(using: .utf8)!
+                return (200, ["Content-Type": "application/json"], ok)
+            }
+            let webhookClient = FeishuMobileBridgeClient(
+                config: MobileBridgeConfig(
+                    webhookURL: URL(string: "https://open.feishu.cn/open-apis/bot/v2/hook/test-hook-token")!
+                ),
+                session: StubURLProtocol.makeSession()
+            )
+            try await webhookClient.pushLifeDock(samplePayload)
+
+            let webhookReqs = StubURLProtocol.requests()
+            try expectEqual(webhookReqs.count, 1)
+            try expectEqual(webhookReqs[0].method, "POST")
+            try expectEqual(webhookReqs[0].url.path, "/open-apis/bot/v2/hook/test-hook-token")
+            let webhookJSON = try expectUnwrap(
+                try JSONSerialization.jsonObject(with: webhookReqs[0].body) as? [String: Any],
+                "Webhook body must be JSON object"
+            )
+            try expectEqual(webhookJSON["msg_type"] as? String, "interactive")
+            let webhookBodyText = String(data: webhookReqs[0].body, encoding: .utf8) ?? ""
+            try expectTrue(webhookBodyText.contains("1."), "Card must number Berth 1")
+            try expectTrue(webhookBodyText.contains("下班去丰巢取冷链快递"), "Card must include Berth 1 raw")
+            try expectTrue(webhookBodyText.contains("取件码 8821"), "Card must include Berth 1 Prep note")
+            try expectTrue(webhookBodyText.contains("2."), "Card must number Berth 2")
+            try expectTrue(webhookBodyText.contains("done 1"), "Card must instruct quick completion reply")
+
+            // 1b. Outbound 1-line ServerChan Webhook
+            StubURLProtocol.install { _ in
+                let ok = #"{"code":0,"message":"success"}"#.data(using: .utf8)!
+                return (200, ["Content-Type": "application/json"], ok)
+            }
+            let serverChanClient = FeishuMobileBridgeClient(
+                config: MobileBridgeConfig(
+                    webhookURL: URL(string: "https://sctapi.ftqq.com/SCT123456.send")!
+                ),
+                session: StubURLProtocol.makeSession()
+            )
+            try await serverChanClient.pushLifeDock(samplePayload)
+            let scReqs = StubURLProtocol.requests()
+            try expectEqual(scReqs.count, 1)
+            let scJSON = try expectUnwrap(
+                try JSONSerialization.jsonObject(with: scReqs[0].body) as? [String: Any],
+                "ServerChan body must be JSON"
+            )
+            try expectTrue((scJSON["title"] as? String)?.contains("MindDock") == true, "ServerChan requires title")
+            try expectTrue((scJSON["desp"] as? String)?.contains("下班去丰巢取冷链快递") == true, "ServerChan requires desp markdown")
+
+            // 2. Bidirectional Feishu App Bot REST (tenant_access_token + im/v1/messages) with token caching
+            StubURLProtocol.install { req in
+                if req.url.path == "/open-apis/auth/v3/tenant_access_token/internal" {
+                    let body = #"{"code":0,"msg":"ok","tenant_access_token":"t-feishu-secret-token","expire":7200}"#
+                    return (200, ["Content-Type": "application/json"], body.data(using: .utf8)!)
+                }
+                if req.url.path == "/open-apis/im/v1/messages" && req.method == "POST" {
+                    let body = #"{"code":0,"msg":"success","data":{"message_id":"om_sent_card_1"}}"#
+                    return (200, ["Content-Type": "application/json"], body.data(using: .utf8)!)
+                }
+                return (404, [:], Data())
+            }
+
+            let appBotClient = FeishuMobileBridgeClient(
+                config: MobileBridgeConfig(
+                    appId: "cli_test_app",
+                    appSecret: "sec_test_secret",
+                    chatId: "oc_user_dm_chat"
+                ),
+                session: StubURLProtocol.makeSession()
+            )
+            try await appBotClient.pushLifeDock(samplePayload)
+            try await appBotClient.pushLifeDock(samplePayload) // 2nd push must reuse cached token!
+
+            let botReqs = StubURLProtocol.requests()
+            try expectEqual(botReqs.count, 3, "Expected 1 auth call + 2 message send calls (token cached)")
+            try expectEqual(botReqs[0].url.path, "/open-apis/auth/v3/tenant_access_token/internal")
+            let authBody = try expectUnwrap(
+                try JSONSerialization.jsonObject(with: botReqs[0].body) as? [String: String],
+                "Auth body must be JSON"
+            )
+            try expectEqual(authBody["app_id"], "cli_test_app")
+            try expectEqual(authBody["app_secret"], "sec_test_secret")
+
+            try expectEqual(botReqs[1].url.path, "/open-apis/im/v1/messages")
+            try expectEqual(botReqs[1].url.query, "receive_id_type=chat_id")
+            try expectEqual(botReqs[1].headers["Authorization"], "Bearer t-feishu-secret-token")
+
+            let sendBody = try expectUnwrap(
+                try JSONSerialization.jsonObject(with: botReqs[1].body) as? [String: Any],
+                "im/v1/messages body must be JSON"
+            )
+            try expectEqual(sendBody["receive_id"] as? String, "oc_user_dm_chat")
+            try expectEqual(sendBody["msg_type"] as? String, "interactive")
+            let contentString = try expectUnwrap(
+                sendBody["content"] as? String,
+                "Feishu im/v1/messages requires card JSON encoded as a String in 'content'"
+            )
+            let parsedCard = try expectUnwrap(
+                try JSONSerialization.jsonObject(with: Data(contentString.utf8)) as? [String: Any],
+                "Card content string must decode to valid JSON object"
+            )
+            try expectTrue(parsedCard["header"] != nil && parsedCard["elements"] != nil, "Interactive card must contain header and elements")
+            try expectTrue(contentString.contains("取件码 8821"), "Encoded card must include Prep note")
+        }
+    },
+    TestCase(name: "feishu_bridge_pulls_messages_with_cursor_downloads_audio_resource_and_transcribes") {
+        try runAsyncTest {
+            let expectedAudioBytes = Data([0x4F, 0x67, 0x67, 0x53, 0xAA, 0xBB, 0xCC])
+            let transcriber = FakeAudioTranscriber(stubbedTranscript: "回程地铁上想到把周报发给总监")
+
+            // Webhook-only client gracefully no-ops on pull
+            let webhookOnly = FeishuMobileBridgeClient(
+                config: MobileBridgeConfig(webhookURL: URL(string: "https://open.feishu.cn/open-apis/bot/v2/hook/x")!),
+                session: StubURLProtocol.makeSession()
+            )
+            let noopBatch = try await webhookOnly.pullMessages(sinceCursor: "cursor-0")
+            try expectEqual(noopBatch.messages, [])
+            try expectEqual(noopBatch.nextCursor, "cursor-0")
+
+            // Bidirectional Feishu App Bot pull #1 (nil cursor -> full unread fetch + audio download)
+            StubURLProtocol.install { req in
+                if req.url.path == "/open-apis/auth/v3/tenant_access_token/internal" {
+                    let body = #"{"code":0,"msg":"ok","tenant_access_token":"t-pull-token","expire":7200}"#
+                    return (200, ["Content-Type": "application/json"], Data(body.utf8))
+                }
+                if req.url.path == "/open-apis/im/v1/messages" && req.method == "GET" {
+                    let comps = URLComponents(url: req.url, resolvingAgainstBaseURL: false)
+                    let startTime = comps?.queryItems?.first(where: { $0.name == "start_time" })?.value
+                    if startTime == nil {
+                        let listJSON = """
+                        {
+                          "code": 0,
+                          "msg": "success",
+                          "data": {
+                            "has_more": false,
+                            "items": [
+                              {
+                                "message_id": "om_bot_echo_1",
+                                "msg_type": "interactive",
+                                "create_time": "1732540005100",
+                                "sender": { "id": "cli_test", "sender_type": "app" },
+                                "body": { "content": "{\\"title\\":\\"MindDock\\"}" }
+                              },
+                              {
+                                "message_id": "om_user_text_1",
+                                "msg_type": "text",
+                                "create_time": "1732540005200",
+                                "sender": { "id": "ou_user", "sender_type": "user" },
+                                "body": { "content": "{\\"text\\":\\"done 1\\"}" }
+                              },
+                              {
+                                "message_id": "om_user_audio_1",
+                                "msg_type": "audio",
+                                "create_time": "1732540005400",
+                                "sender": { "id": "ou_user", "sender_type": "user" },
+                                "body": { "content": "{\\"file_key\\":\\"file_v3_opus_99\\",\\"duration\\":3100}" }
+                              }
+                            ]
+                          }
+                        }
+                        """
+                        return (200, ["Content-Type": "application/json"], Data(listJSON.utf8))
+                    } else if startTime == "1732540005" {
+                        // Second pull in the SAME Unix second 1732540005 returns earlier sub-second items + 1 new item
+                        let listJSON = """
+                        {
+                          "code": 0,
+                          "msg": "success",
+                          "data": {
+                            "has_more": false,
+                            "items": [
+                              {
+                                "message_id": "om_user_audio_1",
+                                "msg_type": "audio",
+                                "create_time": "1732540005400",
+                                "sender": { "id": "ou_user", "sender_type": "user" },
+                                "body": { "content": "{\\"file_key\\":\\"file_v3_opus_99\\"}" }
+                              },
+                              {
+                                "message_id": "om_user_text_2",
+                                "msg_type": "text",
+                                "create_time": "1732540005950",
+                                "sender": { "id": "ou_user", "sender_type": "user" },
+                                "body": { "content": "{\\"text\\":\\"到家记得给猫换水\\"}" }
+                              }
+                            ]
+                          }
+                        }
+                        """
+                        return (200, ["Content-Type": "application/json"], Data(listJSON.utf8))
+                    }
+                }
+                if req.url.path == "/open-apis/im/v1/messages/om_user_audio_1/resources/file_v3_opus_99" {
+                    return (200, ["Content-Type": "application/octet-stream"], expectedAudioBytes)
+                }
+                return (404, [:], Data())
+            }
+
+            let botClient = FeishuMobileBridgeClient(
+                config: MobileBridgeConfig(
+                    appId: "cli_test",
+                    appSecret: "sec_test",
+                    chatId: "oc_dm_99"
+                ),
+                session: StubURLProtocol.makeSession(),
+                audioTranscriber: transcriber
+            )
+
+            let firstBatch = try await botClient.pullMessages(sinceCursor: nil)
+            try expectEqual(firstBatch.nextCursor, "1732540005400#om_user_audio_1")
+            try expectEqual(firstBatch.messages.count, 3)
+            try expectEqual(firstBatch.messages[0].senderRole, .bot)
+            try expectEqual(firstBatch.messages[1].senderRole, .user)
+            try expectEqual(firstBatch.messages[1].kind, .text)
+            try expectEqual(firstBatch.messages[1].text, "done 1")
+            try expectEqual(firstBatch.messages[2].senderRole, .user)
+            try expectEqual(firstBatch.messages[2].kind, .audio)
+            try expectEqual(firstBatch.messages[2].text, "回程地铁上想到把周报发给总监")
+
+            // Audio resource was downloaded exactly once and passed to transcriber
+            try expectEqual(transcriber.receivedClips.count, 1)
+            try expectEqual(transcriber.receivedClips[0].0, expectedAudioBytes)
+
+            // Second pull passes start_time=1732540005 (seconds) and filters out <= 1732540005400 without re-downloading audio!
+            let secondBatch = try await botClient.pullMessages(sinceCursor: firstBatch.nextCursor)
+            try expectEqual(secondBatch.messages.map(\.messageId), ["om_user_text_2"])
+            try expectEqual(secondBatch.messages[0].text, "到家记得给猫换水")
+            try expectEqual(secondBatch.nextCursor, "1732540005950#om_user_text_2")
+            try expectEqual(transcriber.receivedClips.count, 1, "Already-seen sub-second audio item must not be re-downloaded")
+        }
+    },
+    TestCase(name: "end_to_end_24h_shift_journey_with_feishu_rest_bridge_and_sqlite") {
+        try runAsyncTest {
+            try await withTempDatabasePathAsync { dbPath in
+                let voiceBytes = Data([0x4F, 0x67, 0x67, 0x53, 0x11, 0x22])
+                let transcriber = FakeAudioTranscriber(stubbedTranscript: "明早给支付网关加上超时重试告警")
+
+                StubURLProtocol.install { req in
+                    if req.url.path == "/open-apis/auth/v3/tenant_access_token/internal" {
+                        let json = #"{"code":0,"msg":"ok","tenant_access_token":"t-e2e","expire":7200}"#
+                        return (200, ["Content-Type": "application/json"], Data(json.utf8))
+                    }
+                    if req.url.path == "/open-apis/im/v1/messages" && req.method == "POST" {
+                        let json = #"{"code":0,"msg":"success","data":{"message_id":"om_card_out_1"}}"#
+                        return (200, ["Content-Type": "application/json"], Data(json.utf8))
+                    }
+                    if req.url.path == "/open-apis/im/v1/messages" && req.method == "GET" {
+                        let json = """
+                        {
+                          "code": 0,
+                          "msg": "success",
+                          "data": {
+                            "has_more": false,
+                            "items": [
+                              {
+                                "message_id": "om_card_out_1",
+                                "msg_type": "interactive",
+                                "create_time": "1732550001000",
+                                "sender": { "id": "cli_e2e", "sender_type": "app" },
+                                "body": { "content": "{}" }
+                              },
+                              {
+                                "message_id": "om_done_reply",
+                                "msg_type": "text",
+                                "create_time": "1732550002000",
+                                "sender": { "id": "ou_1", "sender_type": "user" },
+                                "body": { "content": "{\\"text\\":\\"完成 1\\"}" }
+                              },
+                              {
+                                "message_id": "om_subway_voice",
+                                "msg_type": "audio",
+                                "create_time": "1732550003000",
+                                "sender": { "id": "ou_1", "sender_type": "user" },
+                                "body": { "content": "{\\"file_key\\":\\"file_e2e_voice\\"}" }
+                              }
+                            ]
+                          }
+                        }
+                        """
+                        return (200, ["Content-Type": "application/json"], Data(json.utf8))
+                    }
+                    if req.url.path == "/open-apis/im/v1/messages/om_subway_voice/resources/file_e2e_voice" {
+                        return (200, ["Content-Type": "application/octet-stream"], voiceBytes)
+                    }
+                    return (404, [:], Data())
+                }
+
+                let feishu = FeishuMobileBridgeClient(
+                    config: MobileBridgeConfig(appId: "cli_e2e", appSecret: "sec_e2e", chatId: "oc_e2e"),
+                    session: StubURLProtocol.makeSession(),
+                    audioTranscriber: transcriber
+                )
+                let engine = try DockEngine(
+                    databasePath: dbPath,
+                    mobileBridge: feishu,
+                    audioTranscriber: transcriber
+                )
+
+                // Daytime at desk: capture Life errands (3 docked + 1 queued)
+                let l1 = try engine.drop("下班去超市买鸡蛋")
+                _ = try engine.attachPrep(id: l1.id, prep: "土鸡蛋一盒")
+                _ = try engine.drop("给猫买冻干", lane: .life)
+                _ = try engine.drop("周末车险续保", lane: .life)
+                let l4 = try engine.drop("下周约牙医洗牙", lane: .life)
+
+                // Evening lid close: Shift to Life pushes card once (sleep after lock is deduplicated)
+                let lockResult = try await engine.shiftAndSync(to: .life)
+                let sleepResult = try await engine.shiftAndSync(to: .life)
+                try expectEqual(lockResult.pushedLifeDock, true)
+                try expectEqual(sleepResult.pushedLifeDock, false)
+
+                let postReqs = StubURLProtocol.requests().filter { $0.url.path == "/open-apis/im/v1/messages" && $0.method == "POST" }
+                try expectEqual(postReqs.count, 1)
+
+                // Next morning lid open: Shift to Work resolves Life #1 (promoting l4) & docks transcribed Work voice Drop!
+                let wakeResult = try await engine.shiftAndSync(to: .work)
+                try expectEqual(wakeResult.snapshot.activeLane, .work)
+                try expectEqual(wakeResult.snapshot.berths.map(\.raw), ["明早给支付网关加上超时重试告警"])
+                try expectEqual(wakeResult.snapshot.berths[0].prepState, .ready)
+
+                let updatedLife = try engine.getDock(lane: .life)
+                try expectEqual(updatedLife.berths.map(\.id).contains(l4.id), true, "Queued l4 promoted after '完成 1'")
+                try expectEqual(updatedLife.berths.map(\.id).contains(l1.id), false, "Resolved l1 sunk to Deep")
+            }
         }
     }
 ]

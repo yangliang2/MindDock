@@ -95,8 +95,64 @@ final class DockViewModel: ObservableObject {
             snapshot = try engine.shift(to: lane)
             statusBanner = "Shifted Dock to \(lane.rawValue.capitalized)"
             onStateChanged?()
+            let engineRef = self.engine
+            Task { [weak self] in
+                do {
+                    let result = try await engineRef.shiftAndSync(to: lane)
+                    await MainActor.run {
+                        guard let self else { return }
+                        self.snapshot = result.snapshot
+                        if result.pushedLifeDock {
+                            self.statusBanner = "Shifted to Life · Pushed to mobile lock screen"
+                        } else if let report = result.syncReport,
+                                  (!report.droppedItems.isEmpty || !report.resolvedItems.isEmpty) {
+                            self.statusBanner = "Synced \(report.droppedItems.count) mobile Drop(s), \(report.resolvedItems.count) resolved"
+                        }
+                        self.onStateChanged?()
+                    }
+                } catch {
+                    await MainActor.run {
+                        self?.statusBanner = "Mobile bridge error: \(error)"
+                    }
+                }
+            }
         } catch {
             statusBanner = "Shift failed: \(error)"
+        }
+    }
+
+    func handleSystemDeparture() {
+        shift(to: .life)
+    }
+
+    func handleSystemArrival() {
+        shift(to: .work)
+    }
+
+    func syncMobileBridgeInBackground(manual: Bool = false) {
+        let engineRef = self.engine
+        Task { [weak self] in
+            do {
+                let report = try await engineRef.syncMobileBridge()
+                await MainActor.run {
+                    guard let self else { return }
+                    if let updated = try? self.engine.getDock() {
+                        self.snapshot = updated
+                    }
+                    if !report.droppedItems.isEmpty || !report.resolvedItems.isEmpty {
+                        self.statusBanner = "Synced \(report.droppedItems.count) mobile Drop(s), \(report.resolvedItems.count) resolved"
+                    } else if manual {
+                        self.statusBanner = "Mobile bridge up to date"
+                    }
+                    self.onStateChanged?()
+                }
+            } catch {
+                if manual {
+                    await MainActor.run {
+                        self?.statusBanner = "Mobile sync failed: \(error)"
+                    }
+                }
+            }
         }
     }
 

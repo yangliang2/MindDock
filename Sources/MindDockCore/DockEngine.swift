@@ -22,8 +22,16 @@ public final class DockEngine: @unchecked Sendable {
     private let lock = NSLock()
     private var db: OpaquePointer?
     private var currentActiveLane: Lane = .work
+    private var mobileBridge: (any MobileBridgeClient)?
+    private var audioTranscriber: (any AudioTranscriber)?
 
-    public init(databasePath: String) throws {
+    public init(
+        databasePath: String,
+        mobileBridge: (any MobileBridgeClient)? = nil,
+        audioTranscriber: (any AudioTranscriber)? = nil
+    ) throws {
+        self.mobileBridge = mobileBridge
+        self.audioTranscriber = audioTranscriber
         if databasePath != ":memory:" {
             let parentDir = URL(fileURLWithPath: databasePath).deletingLastPathComponent()
             try FileManager.default.createDirectory(at: parentDir, withIntermediateDirectories: true)
@@ -56,6 +64,10 @@ public final class DockEngine: @unchecked Sendable {
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS processed_bridge_messages (
+                message_id TEXT PRIMARY KEY,
+                processed_at REAL NOT NULL
+            );
             """)
 
         if let savedLane = try readMetaUnlocked(key: "active_lane"),
@@ -77,6 +89,12 @@ public final class DockEngine: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return currentActiveLane
+    }
+
+    public func setMobileBridge(_ bridge: (any MobileBridgeClient)?) {
+        lock.withLock {
+            self.mobileBridge = bridge
+        }
     }
 
     @discardableResult
@@ -143,6 +161,246 @@ public final class DockEngine: @unchecked Sendable {
             currentActiveLane = lane
             return try buildSnapshotUnlocked(lane: lane)
         }
+    }
+
+    @discardableResult
+    public func attachPrep(id: String, prep: String?, state: PrepState = .ready) throws -> DockItem {
+        lock.lock()
+        defer { lock.unlock() }
+        return try inTransaction {
+            guard try fetchItemUnlocked(id: id) != nil else {
+                throw DockError.itemNotFound(id)
+            }
+            let now = Date()
+            try withStatement("UPDATE dock_items SET prep = ?1, prep_state = ?2, updated_at = ?3 WHERE id = ?4;") { stmt in
+                bindOptionalText(stmt, index: 1, value: prep)
+                bindText(stmt, index: 2, value: state.rawValue)
+                sqlite3_bind_double(stmt, 3, now.timeIntervalSince1970)
+                bindText(stmt, index: 4, value: id)
+                if sqlite3_step(stmt) != SQLITE_DONE {
+                    throw lastSQLiteError()
+                }
+            }
+            guard let updated = try fetchItemUnlocked(id: id) else {
+                throw DockError.itemNotFound(id)
+            }
+            return updated
+        }
+    }
+
+    private static let lastLifePushFingerprintMetaKey = "last_life_push_fingerprint"
+    private static let feishuSyncCursorMetaKey = "feishu_sync_cursor"
+
+    @discardableResult
+    public func shiftAndSync(to lane: Lane) async throws -> ShiftSyncResult {
+        let snap = try shift(to: lane)
+        if lane == .life {
+            if snap.berths.isEmpty {
+                try lock.withLock {
+                    try inTransaction {
+                        try writeMetaUnlocked(key: Self.lastLifePushFingerprintMetaKey, value: "")
+                    }
+                }
+                return ShiftSyncResult(snapshot: snap, pushedLifeDock: false)
+            }
+            let (bridge, savedFingerprint) = try lock.withLock {
+                (self.mobileBridge, try self.readMetaUnlocked(key: Self.lastLifePushFingerprintMetaKey))
+            }
+            guard let bridge else {
+                return ShiftSyncResult(snapshot: snap, pushedLifeDock: false)
+            }
+            let berths = snap.berths.prefix(Self.maxBerths).enumerated().map { index, item in
+                LifeDockPushBerth(
+                    slotNumber: index + 1,
+                    id: item.id,
+                    raw: item.raw,
+                    prep: item.prep
+                )
+            }
+            let fingerprint = Self.computeLifePushFingerprint(berths: berths, queuedCount: snap.queuedCount)
+            if savedFingerprint == fingerprint {
+                return ShiftSyncResult(snapshot: snap, pushedLifeDock: false)
+            }
+            let payload = LifeDockPushPayload(
+                berths: berths,
+                queuedCount: snap.queuedCount,
+                fingerprint: fingerprint
+            )
+            try await bridge.pushLifeDock(payload)
+            try lock.withLock {
+                try inTransaction {
+                    try writeMetaUnlocked(key: Self.lastLifePushFingerprintMetaKey, value: fingerprint)
+                }
+            }
+            return ShiftSyncResult(snapshot: snap, pushedLifeDock: true)
+        } else {
+            let report = try await syncMobileBridge()
+            let updatedSnap = try getDock(lane: .work)
+            return ShiftSyncResult(snapshot: updatedSnap, pushedLifeDock: false, syncReport: report)
+        }
+    }
+
+    @discardableResult
+    public func syncMobileBridge() async throws -> MobileSyncReport {
+        let (bridge, transcriber, sinceCursor) = try lock.withLock {
+            (self.mobileBridge, self.audioTranscriber, try self.readMetaUnlocked(key: Self.feishuSyncCursorMetaKey))
+        }
+        guard let bridge else {
+            return MobileSyncReport(advancedCursor: sinceCursor)
+        }
+
+        let batch = try await bridge.pullMessages(sinceCursor: sinceCursor)
+        let batchLifeBerths = try getDock(lane: .life).berths
+        var resolvedItems: [ResolveResult] = []
+        var droppedItems: [DockItem] = []
+
+        for message in batch.messages {
+            let alreadyProcessed = try lock.withLock {
+                try isBridgeMessageProcessedUnlocked(messageId: message.messageId)
+            }
+            if alreadyProcessed {
+                continue
+            }
+
+            if message.senderRole == .bot {
+                try lock.withLock {
+                    try markBridgeMessageProcessedUnlocked(messageId: message.messageId)
+                }
+                continue
+            }
+
+            var resolvedText = message.text
+            if message.kind == .audio,
+               resolvedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let audioData = message.audioData,
+               let transcriber {
+                resolvedText = try await transcriber.transcribe(
+                    audioData: audioData,
+                    fileExtension: message.audioFileExtension ?? "opus"
+                )
+            }
+
+            if resolvedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                try lock.withLock {
+                    try markBridgeMessageProcessedUnlocked(messageId: message.messageId)
+                }
+                continue
+            }
+
+            if message.kind == .text, let slots = Self.parseCompletionSlots(from: resolvedText) {
+                for slot in slots {
+                    let idx = slot - 1
+                    if idx >= 0 && idx < batchLifeBerths.count {
+                        let targetId = batchLifeBerths[idx].id
+                        let res = try resolveBerth(id: targetId)
+                        resolvedItems.append(res)
+                    }
+                }
+                try lock.withLock {
+                    try markBridgeMessageProcessedUnlocked(messageId: message.messageId)
+                }
+                continue
+            }
+
+            let created = try drop(resolvedText, lane: nil)
+            let prepNote = Self.buildLocalMobilePrep(for: created, kind: message.kind)
+            let enriched = try attachPrep(id: created.id, prep: prepNote, state: .ready)
+            droppedItems.append(enriched)
+
+            try lock.withLock {
+                try markBridgeMessageProcessedUnlocked(messageId: message.messageId)
+            }
+        }
+
+        let finalCursor = batch.nextCursor ?? sinceCursor
+        if let nextCursor = batch.nextCursor, nextCursor != sinceCursor {
+            try lock.withLock {
+                try inTransaction {
+                    try writeMetaUnlocked(key: Self.feishuSyncCursorMetaKey, value: nextCursor)
+                }
+            }
+        }
+
+        return MobileSyncReport(
+            resolvedItems: resolvedItems,
+            droppedItems: droppedItems,
+            advancedCursor: finalCursor
+        )
+    }
+
+    public static func parseCompletionSlots(from raw: String) -> [Int]? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let patterns = [
+            #"^([1-3](?:[\s,，、/]+[1-3])*)$"#,
+            #"^(?:done|ok|resolve|complete|check|已完成|完成|搞定|已办|做好了|好了|✓|✅|☑)[\s:/#\-]*([1-3](?:[\s,，、/#]+[1-3])*)$"#
+        ]
+
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+                continue
+            }
+            let nsRange = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+            if let match = regex.firstMatch(in: trimmed, options: [], range: nsRange),
+               match.numberOfRanges >= 2,
+               let groupRange = Range(match.range(at: 1), in: trimmed) {
+                let digitsPart = String(trimmed[groupRange])
+                var seen = Set<Int>()
+                var result: [Int] = []
+                for ch in digitsPart {
+                    if let val = ch.wholeNumberValue, (1...Self.maxBerths).contains(val), !seen.contains(val) {
+                        seen.insert(val)
+                        result.append(val)
+                    }
+                }
+                if !result.isEmpty {
+                    return result
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func buildLocalMobilePrep(for item: DockItem, kind: InboundMessageKind) -> String {
+        let sourceTag = kind == .audio ? "飞书语音闪投（已转写）" : "飞书移动端闪投"
+        let laneHint = item.lane == .work ? "已备料就绪，回到工位可直接推进" : "已归入生活泊位，离席时自动提醒"
+        return "\(sourceTag) · \(laneHint)"
+    }
+
+    private func isBridgeMessageProcessedUnlocked(messageId: String) throws -> Bool {
+        try withStatement("SELECT 1 FROM processed_bridge_messages WHERE message_id = ?1 LIMIT 1;") { stmt in
+            bindText(stmt, index: 1, value: messageId)
+            let rc = sqlite3_step(stmt)
+            if rc == SQLITE_ROW {
+                return true
+            } else if rc == SQLITE_DONE {
+                return false
+            } else {
+                throw lastSQLiteError()
+            }
+        }
+    }
+
+    private func markBridgeMessageProcessedUnlocked(messageId: String) throws {
+        try withStatement("""
+            INSERT INTO processed_bridge_messages (message_id, processed_at)
+            VALUES (?1, ?2)
+            ON CONFLICT(message_id) DO NOTHING;
+            """) { stmt in
+            bindText(stmt, index: 1, value: messageId)
+            sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
+            if sqlite3_step(stmt) != SQLITE_DONE {
+                throw lastSQLiteError()
+            }
+        }
+    }
+
+    private static func computeLifePushFingerprint(berths: [LifeDockPushBerth], queuedCount: Int) -> String {
+        let parts = berths.map { b in
+            "\(b.slotNumber)|\(b.id)|\(b.raw)|\(b.prep ?? "")"
+        }.joined(separator: "\n")
+        return "q=\(queuedCount)\n\(parts)"
     }
 
     @discardableResult

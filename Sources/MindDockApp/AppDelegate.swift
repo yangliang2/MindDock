@@ -13,6 +13,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
     private var viewModel: DockViewModel?
     private var edgeDockPanel: EdgeDockPanel?
     private var quickDropPanel: QuickDropPanel?
+    private var shiftMonitor: SystemShiftMonitor?
     private let focusTrigger = FocusTriggerModel()
     private weak var previousExternalApp: NSRunningApplication?
 
@@ -20,19 +21,29 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
 
         do {
-            let engine = try DockEngine(databasePath: DockEngine.defaultDatabasePath())
+            let transcriber = MacOSAudioTranscriber()
+            let mobileBridge: (any MobileBridgeClient)? = MobileBridgeConfig.fromEnvironment().map {
+                FeishuMobileBridgeClient(config: $0, audioTranscriber: transcriber)
+            }
+            let engine = try DockEngine(
+                databasePath: DockEngine.defaultDatabasePath(),
+                mobileBridge: mobileBridge,
+                audioTranscriber: transcriber
+            )
             let vm = try DockViewModel(engine: engine)
             self.viewModel = vm
 
             setupPanels(with: vm)
             setupStatusItem(with: vm)
             setupHotKeys()
+            setupSystemShiftMonitor(with: vm)
 
             vm.onStateChanged = { [weak self] in
                 self?.updateStatusItemAppearance()
             }
 
             showEdgeDock()
+            vm.syncMobileBridgeInBackground()
         } catch {
             fputs("Failed to launch MindDock: \(error)\n", stderr)
             NSApp.terminate(nil)
@@ -40,6 +51,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        shiftMonitor?.stop()
         HotKeyManager.shared.unregisterAll()
     }
 
@@ -107,6 +119,14 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         shiftLifeItem.target = self
         menu.addItem(shiftLifeItem)
 
+        let syncMobileItem = NSMenuItem(
+            title: "Sync Mobile Drops Now",
+            action: #selector(handleSyncMobileNow),
+            keyEquivalent: ""
+        )
+        syncMobileItem.target = self
+        menu.addItem(syncMobileItem)
+
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(
@@ -128,6 +148,22 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
             self?.toggleEdgeDock()
         }
         HotKeyManager.shared.registerDefaultHotKeys()
+    }
+
+    private func setupSystemShiftMonitor(with vm: DockViewModel) {
+        let monitor = SystemShiftMonitor(
+            onDeparture: { [weak vm] _ in
+                vm?.handleSystemDeparture()
+            },
+            onArrival: { [weak vm] _ in
+                vm?.handleSystemArrival()
+            },
+            onPeriodicSync: { [weak vm] in
+                vm?.syncMobileBridgeInBackground()
+            }
+        )
+        monitor.start()
+        self.shiftMonitor = monitor
     }
 
     private func updateStatusItemAppearance() {
@@ -211,6 +247,10 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
     @objc private func handleShiftLife() {
         viewModel?.shift(to: .life)
         showEdgeDock()
+    }
+
+    @objc private func handleSyncMobileNow() {
+        viewModel?.syncMobileBridgeInBackground(manual: true)
     }
 
     @objc private func handleQuit() {
