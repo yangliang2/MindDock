@@ -120,7 +120,7 @@ struct EdgeDockView: View {
         VStack(spacing: 8) {
             ForEach(0..<DockEngine.maxBerths, id: \.self) { index in
                 if index < viewModel.snapshot.berths.count {
-                    BerthSlotCard(
+                    BerthSlotView(
                         item: viewModel.snapshot.berths[index],
                         slotNumber: index + 1,
                         accentColor: accentColor,
@@ -162,7 +162,7 @@ struct EdgeDockView: View {
     }
 }
 
-private struct BerthSlotCard: View {
+private struct BerthSlotView: View {
     let item: DockItem
     let slotNumber: Int
     let accentColor: Color
@@ -294,11 +294,11 @@ struct QuickDropBarView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            modeHeaderRow
+            modeHeaderBar
 
             if viewModel.quickBarMode == .drop {
                 dropInputSection
-                dropFooterRow
+                dropFooterBar
             } else {
                 recallInputSection
                 recallResultsSection
@@ -332,7 +332,7 @@ struct QuickDropBarView: View {
         }
     }
 
-    private var modeHeaderRow: some View {
+    private var modeHeaderBar: some View {
         HStack(spacing: 6) {
             ForEach(QuickBarMode.allCases, id: \.self) { mode in
                 let selected = viewModel.quickBarMode == mode
@@ -383,18 +383,33 @@ struct QuickDropBarView: View {
     }
 
     private var dropInputSection: some View {
-        HStack(spacing: 10) {
-            Button {
-                viewModel.toggleVoiceCapture()
-            } label: {
-                Image(systemName: isRecording ? "stop.circle.fill" : "mic.circle.fill")
-                    .font(.system(size: 21))
-                    .foregroundStyle(isRecording ? Color.red : Color.cyan)
-            }
-            .buttonStyle(.plain)
-            .help(isRecording ? "Stop voice capture & release mic immediately" : "Speak a Drop on demand (0% idle mic)")
+        HStack(spacing: 8) {
+            Image(systemName: isRecording ? "stop.circle.fill" : "mic.circle.fill")
+                .font(.system(size: 21))
+                .foregroundStyle(isRecording ? Color.red : Color.cyan)
+                .contentShape(Circle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { _ in
+                            viewModel.beginVoiceMicPress()
+                        }
+                        .onEnded { _ in
+                            viewModel.endVoiceMicPress()
+                        }
+                )
+                .accessibilityElement()
+                .accessibilityLabel(isRecording ? "Stop voice capture" : "Speak a Drop")
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction {
+                    viewModel.toggleVoiceCapture()
+                }
+                .help(isRecording
+                      ? "Release or click to stop voice capture & release mic immediately"
+                      : "Click to toggle or hold to speak a Drop (0% idle mic)")
 
-            TextField("Drop a raw thought or click mic to speak…", text: $viewModel.draftText)
+            speechLocaleSelector
+
+            TextField("Drop a raw thought, or click/hold mic to speak…", text: $viewModel.draftText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 16, weight: .regular))
                 .focused($isInputFocused)
@@ -419,7 +434,31 @@ struct QuickDropBarView: View {
         }
     }
 
-    private var dropFooterRow: some View {
+    private var speechLocaleSelector: some View {
+        HStack(spacing: 2) {
+            ForEach(SpeechLocale.allCases, id: \.self) { locale in
+                let selected = viewModel.speechLocale == locale
+                Button {
+                    viewModel.setSpeechLocale(locale)
+                } label: {
+                    Text(locale.shortLabel)
+                        .font(.system(size: 10, weight: selected ? .semibold : .regular))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2.5)
+                        .background(
+                            Capsule()
+                                .fill(selected ? Color.cyan.opacity(0.24) : Color.clear)
+                        )
+                }
+                .buttonStyle(.plain)
+                .help("Speech recognition locale: \(locale.displayName)")
+            }
+        }
+        .padding(2)
+        .background(Color.secondary.opacity(0.10), in: Capsule())
+    }
+
+    private var dropFooterBar: some View {
         HStack(spacing: 8) {
             ForEach(DropLaneChoice.allCases, id: \.self) { choice in
                 let active = viewModel.dropLaneChoice == choice
@@ -444,7 +483,7 @@ struct QuickDropBarView: View {
 
             Spacer()
 
-            Text("🎤 On-Demand Voice · ↵ Drop · ⇥ Lane")
+            Text("🎤 Click or Hold · \(viewModel.speechLocale.rawValue) · ↵ Drop · ⇥ Lane")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.tertiary)
         }
@@ -491,7 +530,7 @@ struct QuickDropBarView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 6) {
                         ForEach(viewModel.recallResults) { item in
-                            RecallHitRow(item: item) {
+                            RecallHitItem(item: item) {
                                 _ = viewModel.resurfaceFromRecall(id: item.id)
                             }
                         }
@@ -503,7 +542,7 @@ struct QuickDropBarView: View {
     }
 }
 
-private struct RecallHitRow: View {
+private struct RecallHitItem: View {
     let item: DockItem
     let onResurface: () -> Void
 

@@ -22,11 +22,7 @@ MindDock V0.1 交付为**单个原生 macOS 应用包（`dist/MindDock.app`）**
 ./scripts/build-app.sh
 ```
 
-该脚本会编译 Release 二进制、生成菜单栏常驻配置（`LSUIElement` + 按需麦克风/语音识别权限说明）、完成本地签名并输出至 `dist/MindDock.app`。可运行自检验证：
-
-```bash
-./dist/MindDock.app/Contents/MacOS/MindDock --smoke-check
-```
+该脚本会编译 Release 二进制、生成菜单栏常驻配置（`LSUIElement` + 按需麦克风/语音识别权限说明）、完成本地签名并输出至 `dist/MindDock.app`。
 
 ### 2. 配置 AI 备料与飞书手机桥接（二选一，双向互通）
 
@@ -52,9 +48,9 @@ MindDock V0.1 交付为**单个原生 macOS 应用包（`dist/MindDock.app`）**
 
 | 操作 / 场景 | 触发方式 | 行为说明 |
 | :--- | :--- | :--- |
-| **唤醒闪投 / 打捞栏** | `Option + Space`（无需辅助功能权限） | 默认进入 **Drop** 模式；点击麦克风按需语音转写（说完美即释放硬件，平时 **0% CPU、无常亮橙点**），按 `Tab` 可手动指定 `Auto / Work / Life`，按 `Enter` 立即停靠。切换到 **Recall** 标签即可凭模糊印象打捞深海记忆。 |
+| **唤醒闪投 / 打捞栏** | `Option + Space`（无需辅助功能权限） | 默认进入 **Drop** 模式；支持**单击切换录音**或**按住说话松手结束**，可一键切换中英识别语言（`zh-CN` / `en-US`，说完美即释放硬件，平时 **0% CPU、无常亮橙点**），按 `Tab` 可手动指定 `Auto / Work / Life`，按 `Enter` 立即停靠。切换到 **Recall** 标签即可凭模糊印象打捞深海记忆。 |
 | **显隐屏幕边缘停靠台** | `Option + Shift + Space` | 随时召唤或隐藏右侧非抢焦点 3 泊位悬浮停靠台（`EdgeDockPanel`）。 |
-| **泊位一键处置** | 停靠台卡片按钮 | `✓ Resolve` 销项沉入深海并从后台 FIFO 队列自动递补下一项；`⇄ Life/Work` 一键纠偏换道；`↓ Deep` 直接沉入深海记忆。 |
+| **泊位一键处置** | 停靠台泊位按钮 | `✓ Resolve` 销项沉入深海并从后台 FIFO 队列自动递补下一项；`⇄ Life/Work` 一键纠偏换道；`↓ Deep` 直接沉入深海记忆。 |
 | **下班离席（Desk → Phone）** | 锁屏或合盖睡眠自动触发 | `SystemShiftMonitor` 监听系统锁屏/睡眠，自动换场至 `Life` 并将当前活跃的生活泊位 + `Prep` 备料推送到手机飞书锁屏卡片（指纹去重，空台面不打扰）。 |
 | **在外销项与移动闪投（Phone → Mac）** | 在手机飞书对话直接回复 | 在飞书回复 `done 1` / `完成 1` / `1` 自动销项并递补；在地铁或路上随时发**语音或文字**给机器人，回到工位开盖唤醒时自动拉取转写、完成备料并停靠到 `Work` 台面。 |
 

@@ -205,7 +205,7 @@ if [[ "$ENV_FILE" == ".env" ]]; then
 fi
 mkdir -p -m 700 "$(dirname "$ENV_FILE")"
 
-TOTAL_STAGES=4
+TOTAL_STAGES=5
 
 banner "MindDock V0.1 Setup — AI Prep & Mobile Lock-Screen Bridge"
 
@@ -217,7 +217,8 @@ say "Prep notes, and rank vague-impression Recall. Voice Drops run locally via"
 say "macOS Speech Recognition even with a text-only LLM key."
 if confirm "Open DeepSeek API Keys console in your browser now?"; then
   open_url "https://platform.deepseek.com/api_keys"
-  step "Click 'Create new API key', name it 'MindDock', and copy the sk-... key."
+  step "In the left sidebar, click 'API keys' → 'Create new API key'."
+  step "Name the key 'MindDock' and copy the generated sk-... secret."
 fi
 ask MINDDOCK_LLM_BASE_URL "Base URL [default: https://api.deepseek.com/v1]:"
 [[ -z "${MINDDOCK_LLM_BASE_URL:-}" ]] && MINDDOCK_LLM_BASE_URL="https://api.deepseek.com/v1"
@@ -233,7 +234,7 @@ else
 fi
 
 # ── Stage 2: Feishu Open Platform App Bot Credentials ──────────────────────
-stage "Mobile Bridge (1/2): Feishu Serverless App Bot"
+stage "Mobile Bridge (Option A, 1/2): Feishu App Bot Credentials"
 say "A free Feishu Self-Built App Bot gives you full 24h two-way Work ↔ Life"
 say "sync with zero servers and zero custom domain: lock-screen Life pushes on"
 say "Mac sleep/lock, plus off-desk voice/text Drops and 'done 1' replies."
@@ -241,7 +242,7 @@ if confirm "Configure a bidirectional Feishu App Bot now? (Recommended)"; then
   open_url "https://open.feishu.cn/app"
   step "Click '创建企业自建应用' (Create Custom App), name it 'MindDock', and click Create."
   step "In the left sidebar, click '添加应用能力' (Add Capability) → add '机器人' (Bot)."
-  step "In the left sidebar, open '凭证与基础信息' (Credentials & Basic Info)."
+  step "In the left sidebar, open '凭证与基础信息' (Credentials & Basic Info) and copy App ID & App Secret."
   ask MINDDOCK_FEISHU_APP_ID "Paste Feishu App ID (starts with cli_):"
   ask_secret MINDDOCK_FEISHU_APP_SECRET "Paste Feishu App Secret (hidden):"
   [[ -n "${MINDDOCK_FEISHU_APP_ID:-}" ]] && write_env MINDDOCK_FEISHU_APP_ID "$MINDDOCK_FEISHU_APP_ID"
@@ -251,36 +252,55 @@ else
 fi
 
 # ── Stage 3: Feishu Bot Permissions, Release & Chat Binding ────────────────
-stage "Mobile Bridge (2/2): Bot Scopes, Publish & First Chat"
+stage "Mobile Bridge (Option A, 2/2): Bot Scopes, Publish & First Chat"
 MINDDOCK_FEISHU_APP_ID="${MINDDOCK_FEISHU_APP_ID:-$(_existing MINDDOCK_FEISHU_APP_ID || true)}"
 if [[ -n "${MINDDOCK_FEISHU_APP_ID:-}" ]]; then
   open_url "https://open.feishu.cn/app/${MINDDOCK_FEISHU_APP_ID}/auth"
   step "Under '权限管理' (Permissions), enable: im:message, im:message:send_as_bot, im:message.group_msg, im:message.p2p_msg:readonly, im:chat:readonly, im:resource."
-  step "Open '版本管理与发布' (Version Management & Release) → Create Version (e.g. 0.1.0) → Save & Publish."
-  step "On your phone in Feishu, open the 'MindDock' bot chat (or add it to a 1-person group) and send 'hi' so MindDock auto-discovers the chat."
+  step "In the left sidebar, open '版本管理与发布' (Version Management & Release) → '创建版本' (e.g. 0.1.0) → Save & Publish."
+  step "On your phone in Feishu, open the 'MindDock' bot chat (or add it to a 1-person group) and send 'hi' to activate chat discovery."
   ask MINDDOCK_FEISHU_CHAT_ID "Optional Chat ID (oc_..., press Enter for automatic chat discovery):"
   if [[ -n "${MINDDOCK_FEISHU_CHAT_ID:-}" ]]; then
     write_env MINDDOCK_FEISHU_CHAT_ID "$MINDDOCK_FEISHU_CHAT_ID"
   fi
-  pause "Press Enter once your bot version is published and you've sent 'hi' in Feishu"
+  pause "Press Enter once your bot version is published and you've opened the bot chat in Feishu"
 else
   say "No Feishu App ID configured in Stage 2 — skipping bot permission scopes."
   pause "Press Enter to continue"
 fi
 
-# ── Stage 4: Optional Outbound Webhook & Cloud ASR ─────────────────────────
-stage "Optional: 1-Line Webhook Fallback & Cloud ASR"
-say "If you skipped the Feishu App Bot, you can paste a Feishu Custom Group Bot"
-say "Webhook, ServerChan, or PushPlus URL for outbound lock-screen cards, or an"
-say "optional Whisper-compatible ASR URL."
-if confirm "Configure an optional Webhook URL or custom cloud ASR endpoint?"; then
-  ask_secret MINDDOCK_FEISHU_WEBHOOK_URL "Optional Webhook URL (Enter to skip):"
+# ── Stage 4: Optional Outbound-Only Webhook Fallback ───────────────────────
+stage "Optional Outbound Fallback: Group Bot / ServerChan Webhook"
+say "If you skipped the two-way Feishu App Bot, you can configure a 1-line"
+say "outbound Webhook URL (Feishu Custom Group Bot, ServerChan, or generic JSON"
+say "webhook) to receive Life Berths on your phone lock screen when leaving your Mac."
+if confirm "Configure an optional outbound-only Webhook URL?"; then
+  open_url "https://open.feishu.cn/document/client-docs/bot-v3/add-custom-bot"
+  step "In Feishu Desktop: open a 1-person group → Group Settings (⋯) → '群机器人' (Bots) → '添加机器人' (Add Bot) → '自定义机器人' (Custom Bot)."
+  step "Copy the generated Webhook URL (https://open.feishu.cn/open-apis/bot/v2/hook/...), or copy your ServerChan SendKey URL from Dashboard → SendKey at https://sct.ftqq.com/sendkey."
+  ask_secret MINDDOCK_FEISHU_WEBHOOK_URL "Paste Webhook URL (hidden):"
   if [[ -n "${MINDDOCK_FEISHU_WEBHOOK_URL:-}" ]]; then
     write_env MINDDOCK_FEISHU_WEBHOOK_URL "$MINDDOCK_FEISHU_WEBHOOK_URL"
   fi
-  ask MINDDOCK_ASR_URL "Optional ASR URL (.../v1/audio/transcriptions, Enter to skip):"
+else
+  note "Skipped optional outbound Webhook."
+fi
+
+# ── Stage 5: Optional Cloud Whisper ASR Endpoint ───────────────────────────
+stage "Optional Cloud ASR: Whisper Transcription Endpoint"
+say "MindDock uses native macOS Speech Recognition locally by default (Mandarin"
+say "zh-CN & English en-US, 0% idle CPU, no permanent mic dot). Optionally, set"
+say "an OpenAI Whisper-compatible /v1/audio/transcriptions endpoint for cloud ASR."
+if confirm "Configure an optional cloud Whisper ASR endpoint?"; then
+  open_url "https://platform.openai.com/api-keys"
+  step "In OpenAI Platform (Dashboard → API keys) or SiliconFlow (Console → API密钥): ensure your API key has Audio Transcriptions access."
+  step "Enter the transcriptions endpoint URL (e.g. https://api.openai.com/v1/audio/transcriptions) and Whisper model name."
+  ask MINDDOCK_ASR_URL "Cloud ASR URL [e.g. https://api.openai.com/v1/audio/transcriptions]:"
   if [[ -n "${MINDDOCK_ASR_URL:-}" ]]; then
     write_env MINDDOCK_ASR_URL "$MINDDOCK_ASR_URL"
+    ask MINDDOCK_ASR_MODEL "Cloud ASR Model [default: whisper-1]:"
+    [[ -z "${MINDDOCK_ASR_MODEL:-}" ]] && MINDDOCK_ASR_MODEL="whisper-1"
+    write_env MINDDOCK_ASR_MODEL "$MINDDOCK_ASR_MODEL"
   fi
 else
   note "Using native macOS on-demand Speech Recognition (0% idle CPU, no permanent mic dot)."

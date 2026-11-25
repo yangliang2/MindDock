@@ -76,4 +76,3 @@ codesign --verify --deep --strict "${APP_DIR}"
 
 echo "==> Built standalone app bundle: ${APP_DIR}"
 echo "    Launch with: open \"${APP_DIR}\""
-echo "    Smoke check: \"${MACOS_DIR}/${EXECUTABLE_NAME}\" --smoke-check"

@@ -16,6 +16,10 @@ _Avoid_: Dashboard, inbox, todo list, folder
 A single slot on the Dock holding one active thread or actionable item along with its prepared context; once resolved or dismissed, the berth is freed.
 _Avoid_: Card, ticket, row, task
 
+**Lane（场景分道）**:
+One of the two distinct contexts—Work or Life—into which every Drop is routed so each Dock surfaces only what belongs to the user's current setting.
+_Avoid_: Category, folder, tag, project
+
 **Shift（换场）**:
 The automatic transition between the user's Work context and Life context, which determines which items surface onto the active Dock and which step back out of sight.
 _Avoid_: Mode toggle, profile switch

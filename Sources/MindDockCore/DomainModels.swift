@@ -21,6 +21,29 @@ public enum PrepState: String, Codable, Sendable, Equatable {
     case skipped
 }
 
+public enum SpeechLocale: String, Codable, CaseIterable, Sendable, Equatable {
+    case zhCN = "zh-CN"
+    case enUS = "en-US"
+
+    public var shortLabel: String {
+        switch self {
+        case .zhCN: return "中"
+        case .enUS: return "EN"
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .zhCN: return "中文 (zh-CN)"
+        case .enUS: return "English (en-US)"
+        }
+    }
+
+    public var fallbackLocale: SpeechLocale {
+        self == .zhCN ? .enUS : .zhCN
+    }
+}
+
 public struct DockItem: Codable, Sendable, Equatable, Identifiable {
     public let id: String
     public let raw: String

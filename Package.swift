@@ -25,6 +25,7 @@ let package = Package(
             name: "MindDockCore",
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
+                .linkedFramework("AVFoundation"),
                 .linkedFramework("Speech")
             ]
         ),

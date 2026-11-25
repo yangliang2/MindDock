@@ -1,11 +1,12 @@
 import AVFoundation
+import Combine
 import Foundation
-import MindDockCore
 import Speech
 
-protocol VoiceCaptureSessionDriver: Sendable {
+public protocol VoiceCaptureSessionDriver: Sendable {
     var isHardwareActive: Bool { get }
     func start(
+        locale: SpeechLocale,
         recordFallbackFile: Bool,
         onTranscript: @escaping @Sendable (String, Bool) -> Void,
         onError: @escaping @Sendable (String) -> Void
@@ -13,7 +14,19 @@ protocol VoiceCaptureSessionDriver: Sendable {
     func stop() -> URL?
 }
 
-final class NativeSpeechCaptureDriver: VoiceCaptureSessionDriver, @unchecked Sendable {
+public enum VoiceCaptureError: Error, LocalizedError, Sendable {
+    case permissionDenied(String)
+    case hardwareUnavailable(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .permissionDenied(let msg), .hardwareUnavailable(let msg):
+            return msg
+        }
+    }
+}
+
+public final class NativeSpeechCaptureDriver: VoiceCaptureSessionDriver, @unchecked Sendable {
     private let lock = NSLock()
     private var audioEngine: AVAudioEngine?
     private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
@@ -22,13 +35,16 @@ final class NativeSpeechCaptureDriver: VoiceCaptureSessionDriver, @unchecked Sen
     private var recordedFileURL: URL?
     private var hasInstalledTap = false
 
-    var isHardwareActive: Bool {
+    public init() {}
+
+    public var isHardwareActive: Bool {
         lock.lock()
         defer { lock.unlock() }
         return hasInstalledTap || (audioEngine?.isRunning ?? false) || audioEngine != nil
     }
 
-    func start(
+    public func start(
+        locale: SpeechLocale,
         recordFallbackFile: Bool,
         onTranscript: @escaping @Sendable (String, Bool) -> Void,
         onError: @escaping @Sendable (String) -> Void
@@ -56,7 +72,7 @@ final class NativeSpeechCaptureDriver: VoiceCaptureSessionDriver, @unchecked Sen
         var task: SFSpeechRecognitionTask?
 
         if speechAuthorized,
-           let recognizer = Self.makePreferredRecognizer(),
+           let recognizer = Self.makePreferredRecognizer(for: locale),
            recognizer.isAvailable {
             let speechReq = SFSpeechAudioBufferRecognitionRequest()
             speechReq.shouldReportPartialResults = true
@@ -114,7 +130,7 @@ final class NativeSpeechCaptureDriver: VoiceCaptureSessionDriver, @unchecked Sen
     }
 
     @discardableResult
-    func stop() -> URL? {
+    public func stop() -> URL? {
         lock.lock()
         defer { lock.unlock() }
 
@@ -142,14 +158,15 @@ final class NativeSpeechCaptureDriver: VoiceCaptureSessionDriver, @unchecked Sen
         return url
     }
 
-    private static func makePreferredRecognizer() -> SFSpeechRecognizer? {
-        if let current = SFSpeechRecognizer(locale: Locale.current) {
-            return current
+    private static func makePreferredRecognizer(for locale: SpeechLocale) -> SFSpeechRecognizer? {
+        if let primary = SFSpeechRecognizer(locale: Locale(identifier: locale.rawValue)), primary.isAvailable {
+            return primary
         }
-        if let zh = SFSpeechRecognizer(locale: Locale(identifier: "zh-CN")) {
-            return zh
+        if let secondary = SFSpeechRecognizer(locale: Locale(identifier: locale.fallbackLocale.rawValue)), secondary.isAvailable {
+            return secondary
         }
-        return SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        return SFSpeechRecognizer(locale: Locale(identifier: locale.rawValue))
+            ?? SFSpeechRecognizer(locale: Locale(identifier: locale.fallbackLocale.rawValue))
     }
 
     private static func requestMicrophonePermission() async -> Bool {
@@ -157,6 +174,9 @@ final class NativeSpeechCaptureDriver: VoiceCaptureSessionDriver, @unchecked Sen
         case .authorized:
             return true
         case .notDetermined:
+            guard Bundle.main.object(forInfoDictionaryKey: "NSMicrophoneUsageDescription") != nil else {
+                return false
+            }
             return await AVCaptureDevice.requestAccess(for: .audio)
         case .denied, .restricted:
             return false
@@ -170,6 +190,9 @@ final class NativeSpeechCaptureDriver: VoiceCaptureSessionDriver, @unchecked Sen
         case .authorized:
             return true
         case .notDetermined:
+            guard Bundle.main.object(forInfoDictionaryKey: "NSSpeechRecognitionUsageDescription") != nil else {
+                return false
+            }
             return await withCheckedContinuation { continuation in
                 SFSpeechRecognizer.requestAuthorization { status in
                     continuation.resume(returning: status == .authorized)
@@ -183,22 +206,13 @@ final class NativeSpeechCaptureDriver: VoiceCaptureSessionDriver, @unchecked Sen
     }
 }
 
-enum VoiceCaptureError: Error, LocalizedError, Sendable {
-    case permissionDenied(String)
-    case hardwareUnavailable(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .permissionDenied(let msg), .hardwareUnavailable(let msg):
-            return msg
-        }
-    }
-}
-
 @MainActor
-final class VoiceCaptureController: ObservableObject {
-    @Published private(set) var isRecording: Bool = false
-    @Published private(set) var voiceStatusMessage: String?
+public final class VoiceCaptureController: ObservableObject {
+    public static let defaultHoldToSpeakThreshold: TimeInterval = 0.35
+
+    @Published public private(set) var isRecording: Bool = false
+    @Published public private(set) var voiceStatusMessage: String?
+    @Published public var speechLocale: SpeechLocale
 
     private let driver: any VoiceCaptureSessionDriver
     private var intelligenceClient: (any IntelligenceClient)?
@@ -206,30 +220,75 @@ final class VoiceCaptureController: ObservableObject {
     private var basePrefix: String = ""
     private var latestSessionTranscript: String = ""
     private var onTextUpdated: ((String) -> Void)?
+    private var activePressStartedAt: Date?
+    private var currentPressStartedRecording: Bool = false
+    private var captureGeneration: UInt64 = 0
+    private var startTask: Task<Void, Never>?
+    private var pendingASRTask: Task<Void, Never>?
 
-    init(
+    public init(
         driver: any VoiceCaptureSessionDriver = NativeSpeechCaptureDriver(),
         intelligenceClient: (any IntelligenceClient)? = nil,
-        hasASRFallbackEndpoint: Bool = false
+        hasASRFallbackEndpoint: Bool = false,
+        speechLocale: SpeechLocale = .zhCN
     ) {
         self.driver = driver
         self.intelligenceClient = intelligenceClient
         self.hasASRFallbackEndpoint = hasASRFallbackEndpoint
+        self.speechLocale = speechLocale
     }
 
-    func updateIntelligenceClient(
+    public func updateIntelligenceClient(
         _ client: (any IntelligenceClient)?,
-        hasASRFallbackEndpoint: Bool
+        hasASRFallbackEndpoint: Bool,
+        speechLocale: SpeechLocale? = nil
     ) {
         self.intelligenceClient = client
         self.hasASRFallbackEndpoint = hasASRFallbackEndpoint
+        if let speechLocale {
+            self.speechLocale = speechLocale
+        }
     }
 
-    var isHardwareReleased: Bool {
+    public func cycleSpeechLocale() -> SpeechLocale {
+        speechLocale = speechLocale.fallbackLocale
+        return speechLocale
+    }
+
+    public var isHardwareReleased: Bool {
         !isRecording && !driver.isHardwareActive
     }
 
-    func toggleCapture(currentDraft: String, onTextUpdated: @escaping @MainActor (String) -> Void) {
+    public func beginMicPress(
+        at now: Date = Date(),
+        currentDraft: String,
+        onTextUpdated: @escaping @MainActor (String) -> Void
+    ) {
+        guard activePressStartedAt == nil else { return }
+        if isRecording {
+            currentPressStartedRecording = false
+            activePressStartedAt = now
+        } else {
+            currentPressStartedRecording = true
+            startCapture(currentDraft: currentDraft, onTextUpdated: onTextUpdated)
+            activePressStartedAt = now
+        }
+    }
+
+    public func endMicPress(
+        at now: Date = Date(),
+        holdThreshold: TimeInterval = VoiceCaptureController.defaultHoldToSpeakThreshold
+    ) {
+        guard let startedAt = activePressStartedAt else { return }
+        activePressStartedAt = nil
+        let heldDuration = now.timeIntervalSince(startedAt)
+        if !currentPressStartedRecording || heldDuration >= holdThreshold {
+            stopCapture(finalizeWithASRIfNeeded: true)
+        }
+    }
+
+    public func toggleCapture(currentDraft: String, onTextUpdated: @escaping @MainActor (String) -> Void) {
+        activePressStartedAt = nil
         if isRecording {
             stopCapture(finalizeWithASRIfNeeded: true)
         } else {
@@ -237,7 +296,7 @@ final class VoiceCaptureController: ObservableObject {
         }
     }
 
-    func startCapture(currentDraft: String, onTextUpdated: @escaping @MainActor (String) -> Void) {
+    public func startCapture(currentDraft: String, onTextUpdated: @escaping @MainActor (String) -> Void) {
         stopCapture(finalizeWithASRIfNeeded: false)
 
         let trimmedPrefix = currentDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -245,22 +304,28 @@ final class VoiceCaptureController: ObservableObject {
         self.latestSessionTranscript = ""
         self.onTextUpdated = onTextUpdated
         self.isRecording = true
-        self.voiceStatusMessage = "Listening…"
+        self.voiceStatusMessage = "Listening (\(speechLocale.shortLabel))…"
 
+        captureGeneration &+= 1
+        let generation = captureGeneration
         let recordFallback = hasASRFallbackEndpoint
+        let selectedLocale = speechLocale
         let driver = self.driver
 
-        Task { @MainActor [weak self] in
-            guard let self, self.isRecording else {
-                _ = driver.stop()
+        startTask = Task { @MainActor [weak self] in
+            guard let self, self.isRecording, self.captureGeneration == generation else {
+                if let orphan = driver.stop() {
+                    try? FileManager.default.removeItem(at: orphan)
+                }
                 return
             }
             do {
                 try await driver.start(
+                    locale: selectedLocale,
                     recordFallbackFile: recordFallback,
                     onTranscript: { [weak self] text, isFinal in
                         Task { @MainActor [weak self] in
-                            guard let self else { return }
+                            guard let self, self.captureGeneration == generation else { return }
                             let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
                             guard !cleaned.isEmpty else { return }
                             self.latestSessionTranscript = cleaned
@@ -272,7 +337,7 @@ final class VoiceCaptureController: ObservableObject {
                     },
                     onError: { [weak self] message in
                         Task { @MainActor [weak self] in
-                            guard let self, self.isRecording else { return }
+                            guard let self, self.isRecording, self.captureGeneration == generation else { return }
                             if self.latestSessionTranscript.isEmpty {
                                 self.voiceStatusMessage = "Voice stopped: \(message)"
                             }
@@ -280,18 +345,32 @@ final class VoiceCaptureController: ObservableObject {
                         }
                     }
                 )
+                guard self.isRecording, self.captureGeneration == generation else {
+                    if let orphan = driver.stop() {
+                        try? FileManager.default.removeItem(at: orphan)
+                    }
+                    return
+                }
             } catch {
-                _ = driver.stop()
-                self.isRecording = false
-                self.voiceStatusMessage = error.localizedDescription
+                if let orphan = driver.stop() {
+                    try? FileManager.default.removeItem(at: orphan)
+                }
+                if self.captureGeneration == generation {
+                    self.isRecording = false
+                    self.voiceStatusMessage = error.localizedDescription
+                }
             }
         }
     }
 
-    func stopCapture(finalizeWithASRIfNeeded: Bool = false) {
+    public func stopCapture(finalizeWithASRIfNeeded: Bool = false) {
+        captureGeneration &+= 1
+        startTask?.cancel()
+        startTask = nil
         let recordedURL = driver.stop()
         let wasRecording = isRecording
         isRecording = false
+        activePressStartedAt = nil
 
         let needsASRFallback = finalizeWithASRIfNeeded
             && wasRecording
@@ -302,13 +381,30 @@ final class VoiceCaptureController: ObservableObject {
             voiceStatusMessage = "Transcribing audio…"
             let prefix = basePrefix
             let callback = onTextUpdated
-            Task { @MainActor [weak self] in
-                defer { try? FileManager.default.removeItem(at: recordedURL) }
-                if let audioData = try? Data(contentsOf: recordedURL),
+            pendingASRTask = Task { @MainActor [weak self] in
+                let wavURL = recordedURL
+                    .deletingLastPathComponent()
+                    .appendingPathComponent("minddock-drop-\(UUID().uuidString).wav")
+                defer {
+                    try? FileManager.default.removeItem(at: recordedURL)
+                    try? FileManager.default.removeItem(at: wavURL)
+                }
+
+                let uploadURL: URL?
+                if AudioFormatConverter.convertToPCM16kMonoWAV(inputURL: recordedURL, outputURL: wavURL) {
+                    uploadURL = wavURL
+                } else if AudioFormatConverter.isValidWAVFile(at: recordedURL) {
+                    uploadURL = recordedURL
+                } else {
+                    uploadURL = nil
+                }
+
+                if let uploadURL,
+                   let wavData = try? Data(contentsOf: uploadURL),
                    let text = await client.transcribeAudio(
-                       data: audioData,
-                       filename: recordedURL.lastPathComponent,
-                       mimeType: "audio/x-caf"
+                       data: wavData,
+                       filename: "drop.wav",
+                       mimeType: "audio/wav"
                    ) {
                     callback?(prefix + text)
                     self?.voiceStatusMessage = nil
@@ -327,7 +423,22 @@ final class VoiceCaptureController: ObservableObject {
         onTextUpdated = nil
     }
 
-    func cancelCapture() {
+    public func awaitCaptureStarted() async {
+        if let task = startTask {
+            await task.value
+        }
+    }
+
+    public func awaitPendingTranscription() async {
+        if let task = pendingASRTask {
+            await task.value
+            pendingASRTask = nil
+        }
+    }
+
+    public func cancelCapture() {
+        pendingASRTask?.cancel()
+        pendingASRTask = nil
         stopCapture(finalizeWithASRIfNeeded: false)
         voiceStatusMessage = nil
     }

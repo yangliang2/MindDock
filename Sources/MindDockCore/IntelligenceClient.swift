@@ -40,12 +40,20 @@ public enum IntelligenceConnectionError: Error, LocalizedError, Sendable, Equata
 }
 
 public protocol IntelligenceClient: Sendable {
+    var hasAudioTranscriptionEndpoint: Bool { get }
+    func testConnection() async throws -> String
     func prepareDrop(raw: String, explicitLane: Lane?) async -> DropPrepAnalysis
     func rankRecall(query: String, candidates: [DockItem]) async -> [DockItem]
     func transcribeAudio(data: Data, filename: String, mimeType: String) async -> String?
 }
 
 public extension IntelligenceClient {
+    var hasAudioTranscriptionEndpoint: Bool { false }
+
+    func testConnection() async throws -> String {
+        "Connected (local intelligence)"
+    }
+
     func rankRecall(query: String, candidates: [DockItem]) async -> [DockItem] {
         LocalRecallRanker.rank(query: query, candidates: candidates)
     }
@@ -84,59 +92,6 @@ public struct OpenAICompatibleConfiguration: Sendable, Equatable, Codable {
     }
 
     public static let unconfigured = OpenAICompatibleConfiguration()
-
-    public static func fromEnvironmentOrDefaults(
-        environment: [String: String] = ProcessInfo.processInfo.environment,
-        defaults: UserDefaults = .standard
-    ) -> OpenAICompatibleConfiguration {
-        let baseStr = firstNonEmpty(
-            environment["MINDDOCK_LLM_BASE_URL"],
-            environment["OPENAI_BASE_URL"],
-            defaults.string(forKey: "minddock.llm.baseURL")
-        ) ?? "https://api.deepseek.com/v1"
-        let baseURL = URL(string: baseStr) ?? URL(string: "https://api.deepseek.com/v1")!
-
-        let apiKey = firstNonEmpty(
-            environment["MINDDOCK_LLM_API_KEY"],
-            environment["DEEPSEEK_API_KEY"],
-            environment["OPENAI_API_KEY"],
-            defaults.string(forKey: "minddock.llm.apiKey")
-        ) ?? ""
-
-        let model = firstNonEmpty(
-            environment["MINDDOCK_LLM_MODEL"],
-            environment["OPENAI_MODEL"],
-            defaults.string(forKey: "minddock.llm.model")
-        ) ?? "deepseek-chat"
-
-        let asrURLStr = firstNonEmpty(
-            environment["MINDDOCK_ASR_URL"],
-            defaults.string(forKey: "minddock.asr.endpointURL")
-        )
-        let asrURL = asrURLStr.flatMap(URL.init(string:))
-
-        let asrModel = firstNonEmpty(
-            environment["MINDDOCK_ASR_MODEL"],
-            defaults.string(forKey: "minddock.asr.model")
-        ) ?? "whisper-1"
-
-        return OpenAICompatibleConfiguration(
-            baseURL: baseURL,
-            apiKey: apiKey,
-            model: model,
-            asrEndpointURL: asrURL,
-            asrModel: asrModel
-        )
-    }
-
-    private static func firstNonEmpty(_ values: String?...) -> String? {
-        for value in values {
-            if let trimmed = value?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty {
-                return trimmed
-            }
-        }
-        return nil
-    }
 }
 
 public final class OpenAICompatibleIntelligenceClient: IntelligenceClient, @unchecked Sendable {
@@ -144,11 +99,15 @@ public final class OpenAICompatibleIntelligenceClient: IntelligenceClient, @unch
     private let urlSession: URLSession
 
     public init(
-        configuration: OpenAICompatibleConfiguration = .fromEnvironmentOrDefaults(),
+        configuration: OpenAICompatibleConfiguration = .unconfigured,
         urlSession: URLSession = .shared
     ) {
         self.configuration = configuration
         self.urlSession = urlSession
+    }
+
+    public var hasAudioTranscriptionEndpoint: Bool {
+        configuration.asrEndpointURL != nil
     }
 
     public func testConnection() async throws -> String {

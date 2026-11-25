@@ -7,6 +7,7 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
     public var llmModel: String
     public var asrEndpointURL: String
     public var asrModel: String
+    public var speechLocale: SpeechLocale
 
     public var feishuWebhookURL: String
     public var feishuAppId: String
@@ -14,7 +15,6 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
     public var feishuChatId: String
     public var feishuReceiveIdType: String
     public var feishuBaseURL: String
-    public var pushPlusToken: String
 
     public init(
         llmBaseURL: String = "https://api.deepseek.com/v1",
@@ -22,26 +22,57 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
         llmModel: String = "deepseek-chat",
         asrEndpointURL: String = "",
         asrModel: String = "whisper-1",
+        speechLocale: SpeechLocale = .zhCN,
         feishuWebhookURL: String = "",
         feishuAppId: String = "",
         feishuAppSecret: String = "",
         feishuChatId: String = "",
         feishuReceiveIdType: String = "chat_id",
-        feishuBaseURL: String = "https://open.feishu.cn",
-        pushPlusToken: String = ""
+        feishuBaseURL: String = "https://open.feishu.cn"
     ) {
         self.llmBaseURL = llmBaseURL
         self.llmAPIKey = llmAPIKey
         self.llmModel = llmModel
         self.asrEndpointURL = asrEndpointURL
         self.asrModel = asrModel
+        self.speechLocale = speechLocale
         self.feishuWebhookURL = feishuWebhookURL
         self.feishuAppId = feishuAppId
         self.feishuAppSecret = feishuAppSecret
         self.feishuChatId = feishuChatId
         self.feishuReceiveIdType = feishuReceiveIdType
         self.feishuBaseURL = feishuBaseURL
-        self.pushPlusToken = pushPlusToken
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case llmBaseURL
+        case llmAPIKey
+        case llmModel
+        case asrEndpointURL
+        case asrModel
+        case speechLocale
+        case feishuWebhookURL
+        case feishuAppId
+        case feishuAppSecret
+        case feishuChatId
+        case feishuReceiveIdType
+        case feishuBaseURL
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.llmBaseURL = try c.decodeIfPresent(String.self, forKey: .llmBaseURL) ?? "https://api.deepseek.com/v1"
+        self.llmAPIKey = try c.decodeIfPresent(String.self, forKey: .llmAPIKey) ?? ""
+        self.llmModel = try c.decodeIfPresent(String.self, forKey: .llmModel) ?? "deepseek-chat"
+        self.asrEndpointURL = try c.decodeIfPresent(String.self, forKey: .asrEndpointURL) ?? ""
+        self.asrModel = try c.decodeIfPresent(String.self, forKey: .asrModel) ?? "whisper-1"
+        self.speechLocale = try c.decodeIfPresent(SpeechLocale.self, forKey: .speechLocale) ?? .zhCN
+        self.feishuWebhookURL = try c.decodeIfPresent(String.self, forKey: .feishuWebhookURL) ?? ""
+        self.feishuAppId = try c.decodeIfPresent(String.self, forKey: .feishuAppId) ?? ""
+        self.feishuAppSecret = try c.decodeIfPresent(String.self, forKey: .feishuAppSecret) ?? ""
+        self.feishuChatId = try c.decodeIfPresent(String.self, forKey: .feishuChatId) ?? ""
+        self.feishuReceiveIdType = try c.decodeIfPresent(String.self, forKey: .feishuReceiveIdType) ?? "chat_id"
+        self.feishuBaseURL = try c.decodeIfPresent(String.self, forKey: .feishuBaseURL) ?? "https://open.feishu.cn"
     }
 
     public var openAIConfiguration: OpenAICompatibleConfiguration {
@@ -77,7 +108,6 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
         let trimmedReceiveType = Self.nonEmptyOrNil(feishuReceiveIdType) ?? "chat_id"
         let trimmedFeishuBase = Self.nonEmptyOrNil(feishuBaseURL) ?? "https://open.feishu.cn"
         let resolvedFeishuBase = URL(string: trimmedFeishuBase) ?? URL(string: "https://open.feishu.cn")!
-        let trimmedPushPlus = Self.nonEmptyOrNil(pushPlusToken)
 
         let cfg = MobileBridgeConfig(
             webhookURL: webhookURL,
@@ -85,8 +115,7 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
             appSecret: trimmedAppSecret,
             chatId: trimmedChatId,
             receiveIdType: trimmedReceiveType,
-            apiBaseURL: resolvedFeishuBase,
-            pushPlusToken: trimmedPushPlus
+            apiBaseURL: resolvedFeishuBase
         )
         if cfg.webhookURL == nil && !cfg.hasAppBotCredentials {
             return nil
@@ -103,8 +132,7 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
             }
             return "https://\(host)/***REDACTED***"
         }()
-        let pushPlusStatus = Self.nonEmptyOrNil(pushPlusToken) == nil ? "unconfigured" : "***REDACTED***"
-        return "MindDockSettings(llmBaseURL: \(llmBaseURL), llmModel: \(llmModel), llmAPIKey: \(keyStatus), asrEndpointURL: \(asrEndpointURL), feishuAppId: \(feishuAppId), feishuAppSecret: \(secretStatus), feishuChatId: \(feishuChatId), feishuWebhookURL: \(webhookStatus), pushPlusToken: \(pushPlusStatus))"
+        return "MindDockSettings(llmBaseURL: \(llmBaseURL), llmModel: \(llmModel), llmAPIKey: \(keyStatus), asrEndpointURL: \(asrEndpointURL), speechLocale: \(speechLocale.rawValue), feishuAppId: \(feishuAppId), feishuAppSecret: \(secretStatus), feishuChatId: \(feishuChatId), feishuWebhookURL: \(webhookStatus))"
     }
 
     public var description: String {
@@ -120,6 +148,39 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
             return nil
         }
         return trimmed
+    }
+}
+
+public struct MindDockRuntimeAdapters: Sendable {
+    public let intelligenceClient: any IntelligenceClient
+    public let audioTranscriber: any AudioTranscriber
+    public let mobileBridge: (any MobileBridgeClient)?
+
+    public static func make(
+        from settings: MindDockSettings,
+        urlSession: URLSession = .shared
+    ) -> MindDockRuntimeAdapters {
+        let llmConfig = settings.openAIConfiguration
+        let intelligence = OpenAICompatibleIntelligenceClient(
+            configuration: llmConfig,
+            urlSession: urlSession
+        )
+        let transcriber = MacOSAudioTranscriber(
+            preferredLocale: settings.speechLocale,
+            intelligenceClient: intelligence
+        )
+        let bridge: (any MobileBridgeClient)? = settings.mobileBridgeConfig.map {
+            FeishuMobileBridgeClient(
+                config: $0,
+                session: urlSession,
+                audioTranscriber: transcriber
+            )
+        }
+        return MindDockRuntimeAdapters(
+            intelligenceClient: intelligence,
+            audioTranscriber: transcriber,
+            mobileBridge: bridge
+        )
     }
 }
 
@@ -156,7 +217,7 @@ public final class MindDockSettingsStore: @unchecked Sendable {
     public init(
         configJSONURL: URL? = nil,
         primaryDotEnvURL: URL? = nil,
-        additionalDotEnvURLs: [URL]? = nil,
+        additionalDotEnvURLs: [URL] = [],
         environment: [String: String] = ProcessInfo.processInfo.environment,
         defaults: UserDefaults? = .standard
     ) {
@@ -169,19 +230,7 @@ public final class MindDockSettingsStore: @unchecked Sendable {
         } else {
             self.primaryDotEnvURL = configDir.appendingPathComponent(".env")
         }
-
-        if let additionalDotEnvURLs {
-            self.additionalDotEnvURLs = additionalDotEnvURLs
-        } else {
-            let repoDotEnv = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-                .appendingPathComponent(".env")
-            if repoDotEnv.standardizedFileURL != self.primaryDotEnvURL.standardizedFileURL {
-                self.additionalDotEnvURLs = [repoDotEnv]
-            } else {
-                self.additionalDotEnvURLs = []
-            }
-        }
-
+        self.additionalDotEnvURLs = additionalDotEnvURLs
         self.environment = environment
         self.defaults = defaults
     }
@@ -237,6 +286,7 @@ public final class MindDockSettingsStore: @unchecked Sendable {
                 defaults.set(settings.llmModel, forKey: "minddock.llm.model")
                 defaults.set(settings.asrEndpointURL, forKey: "minddock.asr.endpointURL")
                 defaults.set(settings.asrModel, forKey: "minddock.asr.model")
+                defaults.set(settings.speechLocale.rawValue, forKey: "minddock.speech.locale")
                 defaults.set(settings.feishuChatId, forKey: "minddock.feishu.chatId")
                 defaults.set(settings.feishuReceiveIdType, forKey: "minddock.feishu.receiveIdType")
                 defaults.set(settings.feishuBaseURL, forKey: "minddock.feishu.baseURL")
@@ -246,7 +296,6 @@ public final class MindDockSettingsStore: @unchecked Sendable {
                 defaults.removeObject(forKey: "minddock.feishu.appId")
                 defaults.removeObject(forKey: "minddock.feishu.appSecret")
                 defaults.removeObject(forKey: "minddock.feishu.webhookURL")
-                defaults.removeObject(forKey: "minddock.pushplus.token")
             }
         }
     }
@@ -259,13 +308,13 @@ public final class MindDockSettingsStore: @unchecked Sendable {
         "MINDDOCK_LLM_MODEL",
         "MINDDOCK_ASR_URL",
         "MINDDOCK_ASR_MODEL",
+        "MINDDOCK_SPEECH_LOCALE",
         "MINDDOCK_FEISHU_WEBHOOK_URL",
         "MINDDOCK_FEISHU_APP_ID",
         "MINDDOCK_FEISHU_APP_SECRET",
         "MINDDOCK_FEISHU_CHAT_ID",
         "MINDDOCK_FEISHU_RECEIVE_ID_TYPE",
-        "MINDDOCK_FEISHU_BASE_URL",
-        "MINDDOCK_PUSHPLUS_TOKEN"
+        "MINDDOCK_FEISHU_BASE_URL"
     ]
 
     private func settingsFromDefaults() -> MindDockSettings {
@@ -286,6 +335,10 @@ public final class MindDockSettingsStore: @unchecked Sendable {
         if let v = MindDockSettings.nonEmptyOrNil(defaults.string(forKey: "minddock.asr.model")) {
             s.asrModel = v
         }
+        if let v = MindDockSettings.nonEmptyOrNil(defaults.string(forKey: "minddock.speech.locale")),
+           let locale = SpeechLocale(rawValue: v) {
+            s.speechLocale = locale
+        }
         if let v = MindDockSettings.nonEmptyOrNil(defaults.string(forKey: "minddock.feishu.webhookURL")) {
             s.feishuWebhookURL = v
         }
@@ -303,9 +356,6 @@ public final class MindDockSettingsStore: @unchecked Sendable {
         }
         if let v = MindDockSettings.nonEmptyOrNil(defaults.string(forKey: "minddock.feishu.baseURL")) {
             s.feishuBaseURL = v
-        }
-        if let v = MindDockSettings.nonEmptyOrNil(defaults.string(forKey: "minddock.pushplus.token")) {
-            s.pushPlusToken = v
         }
         return s
     }
@@ -326,6 +376,10 @@ public final class MindDockSettingsStore: @unchecked Sendable {
         if let v = Self.firstNonEmpty(env["MINDDOCK_ASR_MODEL"]) {
             settings.asrModel = v
         }
+        if let v = Self.firstNonEmpty(env["MINDDOCK_SPEECH_LOCALE"]),
+           let parsedLocale = SpeechLocale(rawValue: v) {
+            settings.speechLocale = parsedLocale
+        }
         if env["MINDDOCK_FEISHU_WEBHOOK_URL"] != nil {
             settings.feishuWebhookURL = env["MINDDOCK_FEISHU_WEBHOOK_URL"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
@@ -343,9 +397,6 @@ public final class MindDockSettingsStore: @unchecked Sendable {
         }
         if let v = Self.firstNonEmpty(env["MINDDOCK_FEISHU_BASE_URL"]) {
             settings.feishuBaseURL = v
-        }
-        if env["MINDDOCK_PUSHPLUS_TOKEN"] != nil {
-            settings.pushPlusToken = env["MINDDOCK_PUSHPLUS_TOKEN"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
     }
 
@@ -430,13 +481,13 @@ public final class MindDockSettingsStore: @unchecked Sendable {
             ("MINDDOCK_LLM_MODEL", settings.llmModel),
             ("MINDDOCK_ASR_URL", settings.asrEndpointURL),
             ("MINDDOCK_ASR_MODEL", settings.asrModel),
+            ("MINDDOCK_SPEECH_LOCALE", settings.speechLocale.rawValue),
             ("MINDDOCK_FEISHU_WEBHOOK_URL", settings.feishuWebhookURL),
             ("MINDDOCK_FEISHU_APP_ID", settings.feishuAppId),
             ("MINDDOCK_FEISHU_APP_SECRET", settings.feishuAppSecret),
             ("MINDDOCK_FEISHU_CHAT_ID", settings.feishuChatId),
             ("MINDDOCK_FEISHU_RECEIVE_ID_TYPE", settings.feishuReceiveIdType),
-            ("MINDDOCK_FEISHU_BASE_URL", settings.feishuBaseURL),
-            ("MINDDOCK_PUSHPLUS_TOKEN", settings.pushPlusToken)
+            ("MINDDOCK_FEISHU_BASE_URL", settings.feishuBaseURL)
         ]
 
         var outLines = preservedLines

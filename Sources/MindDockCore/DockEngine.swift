@@ -47,6 +47,19 @@ public final class DockEngine: @unchecked Sendable {
         }
     }
 
+    public convenience init(
+        databasePath: String = DockEngine.defaultDatabasePath(),
+        settings: MindDockSettings
+    ) throws {
+        let adapters = MindDockRuntimeAdapters.make(from: settings)
+        try self.init(
+            databasePath: databasePath,
+            intelligenceClient: adapters.intelligenceClient,
+            mobileBridge: adapters.mobileBridge,
+            audioTranscriber: adapters.audioTranscriber
+        )
+    }
+
     public init(
         databasePath: String,
         intelligenceClient: any IntelligenceClient = OpenAICompatibleIntelligenceClient(configuration: .unconfigured),
@@ -128,6 +141,14 @@ public final class DockEngine: @unchecked Sendable {
         return currentActiveLane
     }
 
+    public func applyAdapters(_ adapters: MindDockRuntimeAdapters) {
+        lock.withLock {
+            self.currentIntelligenceClient = adapters.intelligenceClient
+            self.audioTranscriber = adapters.audioTranscriber
+            self.mobileBridge = adapters.mobileBridge
+        }
+    }
+
     public func setIntelligenceClient(_ client: any IntelligenceClient) {
         lock.withLock {
             self.currentIntelligenceClient = client
@@ -138,6 +159,18 @@ public final class DockEngine: @unchecked Sendable {
         lock.withLock {
             self.mobileBridge = bridge
         }
+    }
+
+    public func setAudioTranscriber(_ transcriber: (any AudioTranscriber)?) {
+        lock.withLock {
+            self.audioTranscriber = transcriber
+        }
+    }
+
+    @discardableResult
+    public func testIntelligenceConnection() async throws -> String {
+        let client = self.intelligenceClient
+        return try await client.testConnection()
     }
 
     @discardableResult
@@ -153,15 +186,13 @@ public final class DockEngine: @unchecked Sendable {
 
             return try inTransaction {
                 let resolvedLane = explicitLane ?? Self.inferLaneLocally(for: raw)
-                let dockedCount = try countItems(lane: resolvedLane, status: .docked)
-                let newStatus: ItemStatus = dockedCount < Self.maxBerths ? .docked : .queued
-                let orderSeq = try nextOrderSeqUnlocked()
+                let placement = try allocateLanePlacementUnlocked(in: resolvedLane)
                 let now = Date()
                 let created = DockItem(
                     id: UUID().uuidString.lowercased(),
                     raw: raw,
                     lane: resolvedLane,
-                    status: newStatus,
+                    status: placement.status,
                     prep: nil,
                     prepState: .pending,
                     createdAt: now,
@@ -179,7 +210,7 @@ public final class DockEngine: @unchecked Sendable {
                     bindText(stmt, index: 5, value: created.status.rawValue)
                     bindOptionalText(stmt, index: 6, value: created.prep)
                     bindText(stmt, index: 7, value: created.prepState.rawValue)
-                    sqlite3_bind_int64(stmt, 8, orderSeq)
+                    sqlite3_bind_int64(stmt, 8, placement.orderSeq)
                     sqlite3_bind_double(stmt, 9, created.createdAt.timeIntervalSince1970)
                     sqlite3_bind_double(stmt, 10, created.updatedAt.timeIntervalSince1970)
 
@@ -252,31 +283,6 @@ public final class DockEngine: @unchecked Sendable {
             try writeMetaUnlocked(key: "active_lane", value: lane.rawValue)
             currentActiveLane = lane
             return try buildSnapshotUnlocked(lane: lane)
-        }
-    }
-
-    @discardableResult
-    public func attachPrep(id: String, prep: String?, state: PrepState = .ready) throws -> DockItem {
-        lock.lock()
-        defer { lock.unlock() }
-        return try inTransaction {
-            guard try fetchItemUnlocked(id: id) != nil else {
-                throw DockError.itemNotFound(id)
-            }
-            let now = Date()
-            try withStatement("UPDATE dock_items SET prep = ?1, prep_state = ?2, updated_at = ?3 WHERE id = ?4;") { stmt in
-                bindOptionalText(stmt, index: 1, value: prep)
-                bindText(stmt, index: 2, value: state.rawValue)
-                sqlite3_bind_double(stmt, 3, now.timeIntervalSince1970)
-                bindText(stmt, index: 4, value: id)
-                if sqlite3_step(stmt) != SQLITE_DONE {
-                    throw lastSQLiteError()
-                }
-            }
-            guard let updated = try fetchItemUnlocked(id: id) else {
-                throw DockError.itemNotFound(id)
-            }
-            return updated
         }
     }
 
@@ -410,17 +416,33 @@ public final class DockEngine: @unchecked Sendable {
             }
 
             var resolvedText = message.text
-            if message.kind == .audio,
-               resolvedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               let audioData = message.audioData,
-               let transcriber {
-                resolvedText = try await transcriber.transcribe(
-                    audioData: audioData,
-                    fileExtension: message.audioFileExtension ?? "opus"
-                )
+            if message.kind == .audio {
+                if resolvedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                   let audioData = message.audioData,
+                   !audioData.isEmpty,
+                   let transcriber {
+                    do {
+                        resolvedText = try await transcriber.transcribe(
+                            audioData: audioData,
+                            fileExtension: message.audioFileExtension ?? "opus"
+                        )
+                    } catch {
+                        resolvedText = InboundMobileMessage.audioTranscriptionFallbackText
+                    }
+                }
+                if resolvedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    resolvedText = InboundMobileMessage.audioTranscriptionFallbackText
+                }
             }
 
             if resolvedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                try lock.withLock {
+                    try markBridgeMessageProcessedUnlocked(messageId: message.messageId)
+                }
+                continue
+            }
+
+            if message.kind == .text && Self.isBotActivationPing(resolvedText) {
                 try lock.withLock {
                     try markBridgeMessageProcessedUnlocked(messageId: message.messageId)
                 }
@@ -443,9 +465,8 @@ public final class DockEngine: @unchecked Sendable {
             }
 
             let created = try drop(resolvedText, lane: nil)
-            let prepNote = Self.buildLocalMobilePrep(for: created, kind: message.kind)
-            let enriched = try attachPrep(id: created.id, prep: prepNote, state: .ready)
-            droppedItems.append(enriched)
+            let prepared = try await awaitPrep(id: created.id)
+            droppedItems.append(prepared)
 
             try lock.withLock {
                 try markBridgeMessageProcessedUnlocked(messageId: message.messageId)
@@ -468,7 +489,24 @@ public final class DockEngine: @unchecked Sendable {
         )
     }
 
-    public static func parseCompletionSlots(from raw: String) -> [Int]? {
+    private static let activationPingVocabulary: Set<String> = [
+        "hi", "hello", "hey", "你好", "您好", "嗨", "ping", "/start", "start"
+    ]
+
+    private static func isBotActivationPing(_ raw: String) -> Bool {
+        var cleaned = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if cleaned.hasPrefix("@_user_") {
+            if let spaceIdx = cleaned.firstIndex(where: { $0.isWhitespace }) {
+                cleaned = String(cleaned[spaceIdx...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        let trimSet = CharacterSet.whitespacesAndNewlines
+            .union(CharacterSet(charactersIn: "!！.。~～?？,，"))
+        let normalized = cleaned.trimmingCharacters(in: trimSet).lowercased()
+        return activationPingVocabulary.contains(normalized)
+    }
+
+    private static func parseCompletionSlots(from raw: String) -> [Int]? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
@@ -500,12 +538,6 @@ public final class DockEngine: @unchecked Sendable {
             }
         }
         return nil
-    }
-
-    private static func buildLocalMobilePrep(for item: DockItem, kind: InboundMessageKind) -> String {
-        let sourceTag = kind == .audio ? "飞书语音闪投（已转写）" : "飞书移动端闪投"
-        let laneHint = item.lane == .work ? "已备料就绪，回到工位可直接推进" : "已归入生活泊位，离席时自动提醒"
-        return "\(sourceTag) · \(laneHint)"
     }
 
     private func isBridgeMessageProcessedUnlocked(messageId: String) throws -> Bool {
@@ -556,16 +588,7 @@ public final class DockEngine: @unchecked Sendable {
                 return ResolveResult(sunkItem: target, promotedItem: nil)
             }
 
-            let now = Date()
-            try updateItemUnlocked(id: id, lane: target.lane, status: .deep, orderSeq: nil, updatedAt: now)
-            guard let sunk = try fetchItemUnlocked(id: id) else {
-                throw DockError.itemNotFound(id)
-            }
-
-            var promoted: DockItem? = nil
-            if target.status == .docked {
-                promoted = try promoteOldestQueuedUnlocked(in: target.lane, now: now)
-            }
+            let (sunk, promoted) = try sinkItemToDeepUnlocked(target, now: Date())
             return ResolveResult(sunkItem: sunk, promotedItem: promoted)
         }
     }
@@ -586,51 +609,23 @@ public final class DockEngine: @unchecked Sendable {
                 if current.status == .deep {
                     return current
                 }
-                try updateItemUnlocked(id: id, lane: current.lane, status: .deep, orderSeq: nil, updatedAt: now)
-                if current.status == .docked {
-                    _ = try promoteOldestQueuedUnlocked(in: current.lane, now: now)
-                }
-                guard let updated = try fetchItemUnlocked(id: id) else {
-                    throw DockError.itemNotFound(id)
-                }
-                return updated
+                return try sinkItemToDeepUnlocked(current, now: now).sunk
 
-            case .flipLane, .lane:
-                let destLane: Lane
-                switch target {
-                case .flipLane:
-                    destLane = current.lane.opposite
-                case .lane(let explicitLane):
-                    destLane = explicitLane
-                case .deep:
-                    destLane = current.lane
-                }
-
-                if current.lane == destLane && current.status != .deep {
-                    return current
-                }
-
-                let dockedInDest = try countItems(lane: destLane, status: .docked)
-                let newStatus: ItemStatus = dockedInDest < Self.maxBerths ? .docked : .queued
-                let newOrderSeq = try nextOrderSeqUnlocked()
-
-                try updateItemUnlocked(
-                    id: id,
-                    lane: destLane,
-                    status: newStatus,
-                    orderSeq: newOrderSeq,
+            case .flipLane:
+                return try moveItemToLaneUnlocked(
+                    current,
+                    destLane: current.lane.opposite,
                     laneLocked: true,
-                    updatedAt: now
+                    now: now
                 )
 
-                if current.status == .docked && current.lane != destLane {
-                    _ = try promoteOldestQueuedUnlocked(in: current.lane, now: now)
-                }
-
-                guard let updated = try fetchItemUnlocked(id: id) else {
-                    throw DockError.itemNotFound(id)
-                }
-                return updated
+            case .lane(let explicitLane):
+                return try moveItemToLaneUnlocked(
+                    current,
+                    destLane: explicitLane,
+                    laneLocked: true,
+                    now: now
+                )
             }
         }
     }
@@ -684,32 +679,12 @@ public final class DockEngine: @unchecked Sendable {
                     throw DockError.itemNotFound(id)
                 }
                 let destLane = lane ?? currentActiveLane
-                if current.status != .deep && current.lane == destLane {
-                    return current
-                }
-
-                let now = Date()
-                let dockedInDest = try countItems(lane: destLane, status: .docked)
-                let newStatus: ItemStatus = dockedInDest < Self.maxBerths ? .docked : .queued
-                let newOrderSeq = try nextOrderSeqUnlocked()
-
-                try updateItemUnlocked(
-                    id: id,
-                    lane: destLane,
-                    status: newStatus,
-                    orderSeq: newOrderSeq,
+                return try moveItemToLaneUnlocked(
+                    current,
+                    destLane: destLane,
                     laneLocked: true,
-                    updatedAt: now
+                    now: Date()
                 )
-
-                if current.status == .docked && current.lane != destLane {
-                    _ = try promoteOldestQueuedUnlocked(in: current.lane, now: now)
-                }
-
-                guard let updated = try fetchItemUnlocked(id: id) else {
-                    throw DockError.itemNotFound(id)
-                }
-                return updated
             }
             callback = dockChangedCallback
             return result
@@ -718,7 +693,7 @@ public final class DockEngine: @unchecked Sendable {
         return resurfaced
     }
 
-    // MARK: - Internal SQLite Helpers
+    // MARK: - Internal SQLite & Placement Helpers
 
     private static let lifeSignals: [String] = [
         "下班", "周末", "车险", "续保", "买", "药", "娃", "孩子", "家", "老婆", "老公",
@@ -733,6 +708,55 @@ public final class DockEngine: @unchecked Sendable {
             return .life
         }
         return .work
+    }
+
+    private func allocateLanePlacementUnlocked(in lane: Lane) throws -> (status: ItemStatus, orderSeq: Int64) {
+        let dockedCount = try countItems(lane: lane, status: .docked)
+        let status: ItemStatus = dockedCount < Self.maxBerths ? .docked : .queued
+        let orderSeq = try nextOrderSeqUnlocked()
+        return (status, orderSeq)
+    }
+
+    private func moveItemToLaneUnlocked(
+        _ current: DockItem,
+        destLane: Lane,
+        laneLocked: Bool?,
+        now: Date
+    ) throws -> DockItem {
+        if current.lane == destLane && current.status != .deep {
+            return current
+        }
+
+        let placement = try allocateLanePlacementUnlocked(in: destLane)
+        try updateItemUnlocked(
+            id: current.id,
+            lane: destLane,
+            status: placement.status,
+            orderSeq: placement.orderSeq,
+            laneLocked: laneLocked,
+            updatedAt: now
+        )
+
+        if current.status == .docked && current.lane != destLane {
+            _ = try promoteOldestQueuedUnlocked(in: current.lane, now: now)
+        }
+
+        guard let updated = try fetchItemUnlocked(id: current.id) else {
+            throw DockError.itemNotFound(current.id)
+        }
+        return updated
+    }
+
+    private func sinkItemToDeepUnlocked(_ current: DockItem, now: Date) throws -> (sunk: DockItem, promoted: DockItem?) {
+        try updateItemUnlocked(id: current.id, lane: current.lane, status: .deep, orderSeq: nil, updatedAt: now)
+        guard let sunk = try fetchItemUnlocked(id: current.id) else {
+            throw DockError.itemNotFound(current.id)
+        }
+        var promoted: DockItem? = nil
+        if current.status == .docked {
+            promoted = try promoteOldestQueuedUnlocked(in: current.lane, now: now)
+        }
+        return (sunk, promoted)
     }
 
     private func readMetaUnlocked(key: String) throws -> String? {
@@ -864,53 +888,28 @@ public final class DockEngine: @unchecked Sendable {
                 let locked = try isLaneLockedUnlocked(id: id)
                 let clampedPrep = DropPrepAnalysis.clampPrepLines(analysis.prep)
                 let finalPrepState: PrepState = (clampedPrep != nil && analysis.prepState == .ready) ? .ready : .skipped
-
-                // Preserve any Prep already attached explicitly (e.g., mobile bridge local cue) when LLM is unconfigured/skipped
-                if finalPrepState == .skipped && current.prepState != .pending {
-                    return current
-                }
-
                 let now = Date()
 
                 if !locked && current.status != .deep && analysis.lane != current.lane {
-                    let destLane = analysis.lane
-                    let dockedInDest = try countItems(lane: destLane, status: .docked)
-                    let newStatus: ItemStatus = dockedInDest < Self.maxBerths ? .docked : .queued
-                    let newOrderSeq = try nextOrderSeqUnlocked()
+                    _ = try moveItemToLaneUnlocked(
+                        current,
+                        destLane: analysis.lane,
+                        laneLocked: nil,
+                        now: now
+                    )
+                }
 
-                    try withStatement("""
-                        UPDATE dock_items
-                        SET lane = ?1, status = ?2, order_seq = ?3, prep = ?4, prep_state = ?5, updated_at = ?6
-                        WHERE id = ?7;
-                        """) { stmt in
-                        bindText(stmt, index: 1, value: destLane.rawValue)
-                        bindText(stmt, index: 2, value: newStatus.rawValue)
-                        sqlite3_bind_int64(stmt, 3, newOrderSeq)
-                        bindOptionalText(stmt, index: 4, value: clampedPrep)
-                        bindText(stmt, index: 5, value: finalPrepState.rawValue)
-                        sqlite3_bind_double(stmt, 6, now.timeIntervalSince1970)
-                        bindText(stmt, index: 7, value: id)
-                        if sqlite3_step(stmt) != SQLITE_DONE {
-                            throw lastSQLiteError()
-                        }
-                    }
-
-                    if current.status == .docked {
-                        _ = try promoteOldestQueuedUnlocked(in: current.lane, now: now)
-                    }
-                } else {
-                    try withStatement("""
-                        UPDATE dock_items
-                        SET prep = ?1, prep_state = ?2, updated_at = ?3
-                        WHERE id = ?4;
-                        """) { stmt in
-                        bindOptionalText(stmt, index: 1, value: clampedPrep)
-                        bindText(stmt, index: 2, value: finalPrepState.rawValue)
-                        sqlite3_bind_double(stmt, 3, now.timeIntervalSince1970)
-                        bindText(stmt, index: 4, value: id)
-                        if sqlite3_step(stmt) != SQLITE_DONE {
-                            throw lastSQLiteError()
-                        }
+                try withStatement("""
+                    UPDATE dock_items
+                    SET prep = ?1, prep_state = ?2, updated_at = ?3
+                    WHERE id = ?4;
+                    """) { stmt in
+                    bindOptionalText(stmt, index: 1, value: clampedPrep)
+                    bindText(stmt, index: 2, value: finalPrepState.rawValue)
+                    sqlite3_bind_double(stmt, 3, now.timeIntervalSince1970)
+                    bindText(stmt, index: 4, value: id)
+                    if sqlite3_step(stmt) != SQLITE_DONE {
+                        throw lastSQLiteError()
                     }
                 }
 

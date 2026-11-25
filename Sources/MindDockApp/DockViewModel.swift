@@ -3,12 +3,12 @@ import Foundation
 import MindDockCore
 import SwiftUI
 
-public enum DropLaneChoice: String, CaseIterable, Sendable {
+enum DropLaneChoice: String, CaseIterable, Sendable {
     case auto
     case work
     case life
 
-    public var label: String {
+    var label: String {
         switch self {
         case .auto: return "Auto"
         case .work: return "Work"
@@ -17,11 +17,11 @@ public enum DropLaneChoice: String, CaseIterable, Sendable {
     }
 }
 
-public enum QuickBarMode: String, CaseIterable, Sendable {
+enum QuickBarMode: String, CaseIterable, Sendable {
     case drop
     case recall
 
-    public var label: String {
+    var label: String {
         switch self {
         case .drop: return "Drop"
         case .recall: return "Recall"
@@ -39,6 +39,7 @@ final class DockViewModel: ObservableObject {
     @Published var statusBanner: String?
     @Published var draftText: String = ""
     @Published var dropLaneChoice: DropLaneChoice = .auto
+    @Published private(set) var speechLocale: SpeechLocale
 
     @Published var quickBarMode: QuickBarMode = .drop
     @Published var recallQuery: String = ""
@@ -51,13 +52,17 @@ final class DockViewModel: ObservableObject {
     init(
         engine: DockEngine,
         voiceController: VoiceCaptureController? = nil,
-        settingsStore: MindDockSettingsStore = MindDockSettingsStore()
+        settingsStore: MindDockSettingsStore = MindDockSettingsStore(),
+        initialSettings: MindDockSettings? = nil
     ) throws {
+        let resolvedSettings = initialSettings ?? settingsStore.load()
         self.engine = engine
         self.settingsStore = settingsStore
+        self.speechLocale = resolvedSettings.speechLocale
         self.voiceController = voiceController ?? VoiceCaptureController(
             intelligenceClient: engine.intelligenceClient,
-            hasASRFallbackEndpoint: (engine.intelligenceClient as? OpenAICompatibleIntelligenceClient)?.configuration.asrEndpointURL != nil
+            hasASRFallbackEndpoint: engine.intelligenceClient.hasAudioTranscriptionEndpoint,
+            speechLocale: resolvedSettings.speechLocale
         )
         self.snapshot = try engine.getDock()
 
@@ -108,10 +113,37 @@ final class DockViewModel: ObservableObject {
         }
     }
 
+    func beginVoiceMicPress() {
+        voiceController.beginMicPress(currentDraft: draftText) { [weak self] updatedText in
+            self?.draftText = updatedText
+        }
+    }
+
+    func endVoiceMicPress() {
+        voiceController.endMicPress()
+    }
+
     func toggleVoiceCapture() {
         voiceController.toggleCapture(currentDraft: draftText) { [weak self] updatedText in
             self?.draftText = updatedText
         }
+    }
+
+    func setSpeechLocale(_ locale: SpeechLocale) {
+        guard speechLocale != locale else { return }
+        speechLocale = locale
+        voiceController.speechLocale = locale
+        var currentSettings = settingsStore.load()
+        currentSettings.speechLocale = locale
+        try? settingsStore.save(currentSettings)
+        let adapters = MindDockRuntimeAdapters.make(from: currentSettings)
+        engine.applyAdapters(adapters)
+        voiceController.updateIntelligenceClient(
+            adapters.intelligenceClient,
+            hasASRFallbackEndpoint: adapters.intelligenceClient.hasAudioTranscriptionEndpoint,
+            speechLocale: locale
+        )
+        onStateChanged?()
     }
 
     func stopVoiceCapture() {
@@ -235,26 +267,26 @@ final class DockViewModel: ObservableObject {
     }
 
     func applySettings(_ settings: MindDockSettings) {
-        let llmConfig = settings.openAIConfiguration
-        let intelligence = OpenAICompatibleIntelligenceClient(configuration: llmConfig)
-        let transcriber = MacOSAudioTranscriber()
-        let bridge: (any MobileBridgeClient)? = settings.mobileBridgeConfig.map {
-            FeishuMobileBridgeClient(config: $0, audioTranscriber: transcriber)
-        }
-        engine.setIntelligenceClient(intelligence)
-        engine.setMobileBridge(bridge)
+        speechLocale = settings.speechLocale
+        let adapters = MindDockRuntimeAdapters.make(from: settings)
+        engine.applyAdapters(adapters)
         voiceController.updateIntelligenceClient(
-            intelligence,
-            hasASRFallbackEndpoint: llmConfig.asrEndpointURL != nil
+            adapters.intelligenceClient,
+            hasASRFallbackEndpoint: adapters.intelligenceClient.hasAudioTranscriptionEndpoint,
+            speechLocale: settings.speechLocale
         )
         statusBanner = "Settings applied live"
         onStateChanged?()
     }
 
+    func testIntelligenceConnection() async throws -> String {
+        try await engine.testIntelligenceConnection()
+    }
+
     func triggerTestMobilePush() async throws -> MobilePushTestResult {
         let result = try await engine.testMobilePush()
         if result.usedSamplePreview {
-            statusBanner = "Sent sample test card to phone lock screen"
+            statusBanner = "Sent sample Life Dock preview to phone lock screen"
         } else {
             statusBanner = "Pushed \(result.pushedBerthCount) Life Berth(s) to phone lock screen"
         }

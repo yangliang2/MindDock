@@ -68,15 +68,15 @@ final class SettingsViewModel: ObservableObject {
     func testLLMConnection() async {
         guard !isBusy else { return }
         guard saveAndApply() else { return }
+        guard let dockViewModel else { return }
 
         isBusy = true
         feedbackKind = .working
         feedbackMessage = "Testing OpenAI-compatible chat completion (\(draft.openAIConfiguration.model))…"
         defer { isBusy = false }
 
-        let client = OpenAICompatibleIntelligenceClient(configuration: draft.openAIConfiguration)
         do {
-            let summary = try await client.testConnection()
+            let summary = try await dockViewModel.testIntelligenceConnection()
             feedbackKind = .success
             feedbackMessage = "✓ LLM ready — \(summary)"
         } catch {
@@ -250,6 +250,16 @@ struct SettingsView: View {
                     .textFieldStyle(.roundedBorder)
             }
 
+            labeledField("Speech") {
+                Picker("", selection: $viewModel.draft.speechLocale) {
+                    ForEach(SpeechLocale.allCases, id: \.self) { locale in
+                        Text(locale.displayName).tag(locale)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+            }
+
             HStack {
                 Text("Voice Drops use on-demand macOS Speech Recognition by default (0% idle CPU, no permanent mic dot).")
                     .font(.system(size: 10.5))
@@ -317,7 +327,7 @@ struct SettingsView: View {
 
             Divider()
 
-            Text("Option B (1-Line Outbound Only): Feishu Group Bot Webhook, ServerChan, or PushPlus URL for lock-screen cards.")
+            Text("Option B (1-Line Outbound Only): Feishu Group Bot Webhook, ServerChan, or generic JSON webhook URL for lock-screen notifications.")
                 .font(.system(size: 11))
                 .foregroundStyle(.secondary)
 

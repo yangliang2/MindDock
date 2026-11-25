@@ -26,26 +26,14 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
 
         do {
             let initialSettings = settingsStore.load()
-            let llmConfig = initialSettings.openAIConfiguration
-            let intelligence = OpenAICompatibleIntelligenceClient(configuration: llmConfig)
-            let transcriber = MacOSAudioTranscriber()
-            let mobileBridge: (any MobileBridgeClient)? = initialSettings.mobileBridgeConfig.map {
-                FeishuMobileBridgeClient(config: $0, audioTranscriber: transcriber)
-            }
             let engine = try DockEngine(
                 databasePath: DockEngine.defaultDatabasePath(),
-                intelligenceClient: intelligence,
-                mobileBridge: mobileBridge,
-                audioTranscriber: transcriber
-            )
-            let voice = VoiceCaptureController(
-                intelligenceClient: intelligence,
-                hasASRFallbackEndpoint: llmConfig.asrEndpointURL != nil
+                settings: initialSettings
             )
             let vm = try DockViewModel(
                 engine: engine,
-                voiceController: voice,
-                settingsStore: settingsStore
+                settingsStore: settingsStore,
+                initialSettings: initialSettings
             )
             self.viewModel = vm
 
