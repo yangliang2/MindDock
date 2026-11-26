@@ -27,7 +27,7 @@ struct EdgeDockView: View {
                 .fill(Color(nsColor: .windowBackgroundColor).opacity(0.95))
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
+                    .strokeBorder(Color.primary.opacity(0.12), lineWidth: 1)
                 )
         )
     }
@@ -52,7 +52,7 @@ struct EdgeDockView: View {
                     HStack(spacing: 3) {
                         Image(systemName: "sparkle.magnifyingglass")
                             .font(.system(size: 10))
-                        Text("Recall")
+                        Text("打捞")
                             .font(.system(size: 11, weight: .medium))
                     }
                     .padding(.horizontal, 7)
@@ -60,17 +60,17 @@ struct EdgeDockView: View {
                     .background(Color.secondary.opacity(0.12), in: Capsule())
                 }
                 .buttonStyle(.plain)
-                .help("Recall items from the Deep by vague impression")
+                .help("凭模糊印象从深海打捞过往事项")
 
                 Button(action: onOpenQuickDrop) {
-                    Text("+ Drop")
+                    Text("+ 闪投")
                         .font(.system(size: 11, weight: .medium))
                         .padding(.horizontal, 8)
                         .padding(.vertical, 3)
                         .background(accentColor.opacity(0.16), in: Capsule())
                 }
                 .buttonStyle(.plain)
-                .help("Open Quick Drop (Option + Space)")
+                .help("打开快速闪投栏 (⌥Space)")
 
                 Button(action: onOpenSettings) {
                     Image(systemName: "gearshape")
@@ -79,7 +79,7 @@ struct EdgeDockView: View {
                         .frame(width: 20, height: 20)
                 }
                 .buttonStyle(.plain)
-                .help("Settings & Mobile Setup (⌘,)")
+                .help("设置与手机连接… (⌘,)")
 
                 Button(action: onHideDock) {
                     Image(systemName: "xmark")
@@ -88,7 +88,7 @@ struct EdgeDockView: View {
                         .frame(width: 20, height: 20)
                 }
                 .buttonStyle(.plain)
-                .help("Hide Edge Dock (Option + Shift + Space)")
+                .help("隐藏边缘停靠台 (⌥⇧Space)")
             }
 
             HStack(spacing: 6) {
@@ -100,7 +100,7 @@ struct EdgeDockView: View {
                         HStack(spacing: 4) {
                             Image(systemName: lane == .work ? "desktopcomputer" : "figure.walk")
                                 .font(.system(size: 10))
-                            Text(lane == .work ? "Work Dock" : "Life Dock")
+                            Text(lane.dockTitle)
                                 .font(.system(size: 11, weight: isSelected ? .semibold : .regular))
                         }
                         .frame(maxWidth: .infinity)
@@ -138,12 +138,12 @@ struct EdgeDockView: View {
     private var footerSection: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 8) {
-                Text("\(viewModel.snapshot.queuedCount) queued")
+                Text("候补 \(viewModel.snapshot.queuedCount) 项")
                 Text("·")
-                Text("\(viewModel.snapshot.offstageCount) in \(viewModel.snapshot.lane.opposite.rawValue.capitalized)")
+                Text("\(viewModel.snapshot.lane.opposite.displayTitle)后台 \(viewModel.snapshot.offstageCount) 项")
                 Spacer()
                 Button(action: onOpenRecall) {
-                    Text("Deep \(viewModel.snapshot.deepCount) ↗")
+                    Text("深海 \(viewModel.snapshot.deepCount) ↗")
                         .underline()
                 }
                 .buttonStyle(.plain)
@@ -184,7 +184,7 @@ private struct BerthSlotView: View {
                     HStack(spacing: 4) {
                         Image(systemName: "sparkles")
                             .font(.system(size: 9))
-                        Text("Prep")
+                        Text("AI 备料")
                             .font(.system(size: 9.5, weight: .semibold))
                     }
                     .foregroundStyle(accentColor)
@@ -202,41 +202,41 @@ private struct BerthSlotView: View {
                 HStack(spacing: 5) {
                     Image(systemName: "ellipsis.circle")
                         .font(.system(size: 10))
-                    Text("Preparing context…")
+                    Text("正在后台备料…")
                         .font(.system(size: 10.5))
                 }
                 .foregroundStyle(.tertiary)
             }
 
             HStack(spacing: 6) {
-                Text("Berth #\(slotNumber)")
+                Text("泊位 #\(slotNumber)")
                     .font(.system(size: 10))
                     .foregroundStyle(.tertiary)
 
                 Spacer()
 
                 Button(action: onFlipLane) {
-                    Text("⇄ \(item.lane.opposite.rawValue.capitalized)")
+                    Text("⇄ 切到\(item.lane.opposite.displayTitle)")
                         .font(.system(size: 10.5, weight: .medium))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
                         .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 5))
                 }
                 .buttonStyle(.plain)
-                .help("Flip lane between Work and Life")
+                .help("在工作与生活分道之间切换")
 
                 Button(action: onSinkDeep) {
-                    Text("↓ Deep")
+                    Text("↓ 沉底")
                         .font(.system(size: 10.5, weight: .medium))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
                         .background(Color.secondary.opacity(0.12), in: RoundedRectangle(cornerRadius: 5))
                 }
                 .buttonStyle(.plain)
-                .help("Sink straight into the Deep")
+                .help("无需待办，直接沉入深海留存")
 
                 Button(action: onResolve) {
-                    Text("✓ Resolve")
+                    Text("✓ 办结")
                         .font(.system(size: 10.5, weight: .semibold))
                         .foregroundStyle(accentColor)
                         .padding(.horizontal, 7)
@@ -244,7 +244,7 @@ private struct BerthSlotView: View {
                         .background(accentColor.opacity(0.16), in: RoundedRectangle(cornerRadius: 5))
                 }
                 .buttonStyle(.plain)
-                .help("Resolve Berth and promote oldest queued item")
+                .help("办结释放泊位，并自动递补候补首项")
             }
         }
         .padding(10)
@@ -265,7 +265,7 @@ private struct EmptyBerthSlot: View {
 
     var body: some View {
         HStack {
-            Text("Berth #\(slotNumber) · Clear mind")
+            Text("泊位 #\(slotNumber) · 台面留白")
                 .font(.system(size: 11.5))
                 .foregroundStyle(.tertiary)
             Spacer()
@@ -372,7 +372,7 @@ struct QuickDropBarView: View {
 
             Spacer()
 
-            Button("Esc") {
+            Button("收起 Esc") {
                 viewModel.cancelQuickBarSession()
                 onCancelled()
             }
@@ -398,18 +398,18 @@ struct QuickDropBarView: View {
                         }
                 )
                 .accessibilityElement()
-                .accessibilityLabel(isRecording ? "Stop voice capture" : "Speak a Drop")
+                .accessibilityLabel(isRecording ? "停止语音录制" : "语音闪投")
                 .accessibilityAddTraits(.isButton)
                 .accessibilityAction {
                     viewModel.toggleVoiceCapture()
                 }
                 .help(isRecording
-                      ? "Release or click to stop voice capture & release mic immediately"
-                      : "Click to toggle or hold to speak a Drop (0% idle mic)")
+                      ? "松开或点击结束录音，立即释放麦克风"
+                      : "点击切换录音，或按住直接说话闪投（平时零麦克风占用）")
 
             speechLocaleSelector
 
-            TextField("Drop a raw thought, or click/hold mic to speak…", text: $viewModel.draftText)
+            TextField("随手闪投一个念头，或点击/按住左侧麦克风直接说…", text: $viewModel.draftText)
                 .textFieldStyle(.plain)
                 .font(.system(size: 16, weight: .regular))
                 .focused($isInputFocused)
@@ -424,7 +424,7 @@ struct QuickDropBarView: View {
                     onSubmitted()
                 }
             } label: {
-                Text("Drop ↵")
+                Text("闪投 ↵")
                     .font(.system(size: 12, weight: .semibold))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
@@ -451,7 +451,7 @@ struct QuickDropBarView: View {
                         )
                 }
                 .buttonStyle(.plain)
-                .help("Speech recognition locale: \(locale.displayName)")
+                .help("语音识别语言：\(locale.displayName)")
             }
         }
         .padding(2)
@@ -477,13 +477,13 @@ struct QuickDropBarView: View {
                 .buttonStyle(.plain)
             }
 
-            Text("→ \(viewModel.predictedLaneForDraft.rawValue.capitalized) Dock")
+            Text("→ 归入\(viewModel.predictedLaneForDraft.dockTitle)")
                 .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(.secondary)
 
             Spacer()
 
-            Text("🎤 Click or Hold · \(viewModel.speechLocale.rawValue) · ↵ Drop · ⇥ Lane")
+            Text("🎤 点击或长按说话 · ↵ 闪投 · ⇥ 切换分道")
                 .font(.system(size: 10.5))
                 .foregroundStyle(.tertiary)
         }
@@ -495,7 +495,7 @@ struct QuickDropBarView: View {
                 .font(.system(size: 17))
                 .foregroundStyle(.purple)
 
-            TextField("Describe a vague impression from the Deep (synonyms OK)…", text: $viewModel.recallQuery)
+            TextField("输入模糊印象或近义词，从深海打捞历史事项…", text: $viewModel.recallQuery)
                 .textFieldStyle(.plain)
                 .font(.system(size: 15.5, weight: .regular))
                 .focused($isInputFocused)
@@ -506,7 +506,7 @@ struct QuickDropBarView: View {
             Button {
                 Task { await viewModel.performRecall() }
             } label: {
-                Text(viewModel.isRecalling ? "Searching…" : "Recall ↵")
+                Text(viewModel.isRecalling ? "打捞中…" : "打捞 ↵")
                     .font(.system(size: 12, weight: .semibold))
                     .padding(.horizontal, 10)
                     .padding(.vertical, 5)
@@ -521,8 +521,8 @@ struct QuickDropBarView: View {
         VStack(alignment: .leading, spacing: 6) {
             if viewModel.recallResults.isEmpty {
                 Text(viewModel.isRecalling
-                     ? "Ranking Deep items by contextual relevance…"
-                     : "No matching Deep items yet. Press ↵ to search by vague impression.")
+                     ? "正在按语境关联度从深海打捞…"
+                     : "暂无匹配的深海记录，输入模糊印象按 ↵ 即可打捞。")
                     .font(.system(size: 11.5))
                     .foregroundStyle(.secondary)
                     .padding(.vertical, 4)
@@ -564,7 +564,7 @@ private struct RecallHitItem: View {
 
             Spacer()
 
-            Text(item.lane.rawValue.capitalized)
+            Text(item.lane.displayTitle)
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 6)
@@ -572,7 +572,7 @@ private struct RecallHitItem: View {
                 .background(Color.secondary.opacity(0.12), in: Capsule())
 
             Button(action: onResurface) {
-                Text("↑ Resurface")
+                Text("↑ 捞回台面")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(.purple)
                     .padding(.horizontal, 8)
@@ -580,7 +580,7 @@ private struct RecallHitItem: View {
                     .background(Color.purple.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
             }
             .buttonStyle(.plain)
-            .help("Bring this Deep item back onto the active Dock")
+            .help("将这条深海记录重新捞回当前停靠台")
         }
         .padding(8)
         .background(

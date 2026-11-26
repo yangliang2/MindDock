@@ -37,7 +37,8 @@ let package = Package(
                 .linkedFramework("SwiftUI"),
                 .linkedFramework("Carbon"),
                 .linkedFramework("AVFoundation"),
-                .linkedFramework("Speech")
+                .linkedFramework("Speech"),
+                .linkedFramework("CoreImage")
             ]
         ),
         .executableTarget(

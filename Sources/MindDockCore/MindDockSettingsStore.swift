@@ -1,6 +1,75 @@
 import Darwin
 import Foundation
 
+public enum LLMProviderPreset: String, CaseIterable, Sendable, Equatable {
+    case deepseek
+    case qwen
+    case siliconFlow
+    case openAI
+
+    public var title: String {
+        switch self {
+        case .deepseek: return "DeepSeek（推荐）"
+        case .qwen: return "通义千问"
+        case .siliconFlow: return "硅基流动"
+        case .openAI: return "OpenAI"
+        }
+    }
+
+    public var subtitle: String {
+        switch self {
+        case .deepseek: return "高性价比 · 中文极佳"
+        case .qwen: return "阿里云百炼 qwen-plus"
+        case .siliconFlow: return "SiliconFlow 聚合"
+        case .openAI: return "gpt-4o-mini"
+        }
+    }
+
+    public var baseURL: String {
+        switch self {
+        case .deepseek: return "https://api.deepseek.com/v1"
+        case .qwen: return "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        case .siliconFlow: return "https://api.siliconflow.cn/v1"
+        case .openAI: return "https://api.openai.com/v1"
+        }
+    }
+
+    public var defaultModel: String {
+        switch self {
+        case .deepseek: return "deepseek-chat"
+        case .qwen: return "qwen-plus"
+        case .siliconFlow: return "deepseek-ai/DeepSeek-V3"
+        case .openAI: return "gpt-4o-mini"
+        }
+    }
+
+    public var apiKeyConsoleURL: URL {
+        switch self {
+        case .deepseek: return URL(string: "https://platform.deepseek.com/api_keys")!
+        case .qwen: return URL(string: "https://bailian.console.aliyun.com/?apiKey=1")!
+        case .siliconFlow: return URL(string: "https://cloud.siliconflow.cn/account/ak")!
+        case .openAI: return URL(string: "https://platform.openai.com/api-keys")!
+        }
+    }
+
+    public static func matching(baseURL: String) -> LLMProviderPreset? {
+        let normalized = baseURL.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized.contains("deepseek.com") {
+            return .deepseek
+        }
+        if normalized.contains("dashscope.aliyuncs.com") {
+            return .qwen
+        }
+        if normalized.contains("siliconflow.cn") {
+            return .siliconFlow
+        }
+        if normalized.contains("api.openai.com") {
+            return .openAI
+        }
+        return nil
+    }
+}
+
 public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConvertible, CustomDebugStringConvertible {
     public var llmBaseURL: String
     public var llmAPIKey: String
@@ -13,8 +82,10 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
     public var feishuAppId: String
     public var feishuAppSecret: String
     public var feishuChatId: String
+    public var feishuOpenId: String
     public var feishuReceiveIdType: String
     public var feishuBaseURL: String
+    public var onboardingCompleted: Bool
 
     public init(
         llmBaseURL: String = "https://api.deepseek.com/v1",
@@ -27,8 +98,10 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
         feishuAppId: String = "",
         feishuAppSecret: String = "",
         feishuChatId: String = "",
+        feishuOpenId: String = "",
         feishuReceiveIdType: String = "chat_id",
-        feishuBaseURL: String = "https://open.feishu.cn"
+        feishuBaseURL: String = "https://open.feishu.cn",
+        onboardingCompleted: Bool = false
     ) {
         self.llmBaseURL = llmBaseURL
         self.llmAPIKey = llmAPIKey
@@ -40,8 +113,10 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
         self.feishuAppId = feishuAppId
         self.feishuAppSecret = feishuAppSecret
         self.feishuChatId = feishuChatId
+        self.feishuOpenId = feishuOpenId
         self.feishuReceiveIdType = feishuReceiveIdType
         self.feishuBaseURL = feishuBaseURL
+        self.onboardingCompleted = onboardingCompleted
     }
 
     enum CodingKeys: String, CodingKey {
@@ -55,8 +130,10 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
         case feishuAppId
         case feishuAppSecret
         case feishuChatId
+        case feishuOpenId
         case feishuReceiveIdType
         case feishuBaseURL
+        case onboardingCompleted
     }
 
     public init(from decoder: Decoder) throws {
@@ -71,8 +148,16 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
         self.feishuAppId = try c.decodeIfPresent(String.self, forKey: .feishuAppId) ?? ""
         self.feishuAppSecret = try c.decodeIfPresent(String.self, forKey: .feishuAppSecret) ?? ""
         self.feishuChatId = try c.decodeIfPresent(String.self, forKey: .feishuChatId) ?? ""
+        self.feishuOpenId = try c.decodeIfPresent(String.self, forKey: .feishuOpenId) ?? ""
         self.feishuReceiveIdType = try c.decodeIfPresent(String.self, forKey: .feishuReceiveIdType) ?? "chat_id"
         self.feishuBaseURL = try c.decodeIfPresent(String.self, forKey: .feishuBaseURL) ?? "https://open.feishu.cn"
+        self.onboardingCompleted = try c.decodeIfPresent(Bool.self, forKey: .onboardingCompleted) ?? false
+    }
+
+    public var shouldAutoPresentOnboarding: Bool {
+        !onboardingCompleted
+            && Self.nonEmptyOrNil(llmAPIKey) == nil
+            && mobileBridgeConfig == nil
     }
 
     public var openAIConfiguration: OpenAICompatibleConfiguration {
@@ -105,6 +190,7 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
         let trimmedAppId = Self.nonEmptyOrNil(feishuAppId)
         let trimmedAppSecret = Self.nonEmptyOrNil(feishuAppSecret)
         let trimmedChatId = Self.nonEmptyOrNil(feishuChatId)
+        let trimmedOpenId = Self.nonEmptyOrNil(feishuOpenId)
         let trimmedReceiveType = Self.nonEmptyOrNil(feishuReceiveIdType) ?? "chat_id"
         let trimmedFeishuBase = Self.nonEmptyOrNil(feishuBaseURL) ?? "https://open.feishu.cn"
         let resolvedFeishuBase = URL(string: trimmedFeishuBase) ?? URL(string: "https://open.feishu.cn")!
@@ -114,6 +200,7 @@ public struct MindDockSettings: Codable, Sendable, Equatable, CustomStringConver
             appId: trimmedAppId,
             appSecret: trimmedAppSecret,
             chatId: trimmedChatId,
+            openId: trimmedOpenId,
             receiveIdType: trimmedReceiveType,
             apiBaseURL: resolvedFeishuBase
         )
@@ -288,8 +375,10 @@ public final class MindDockSettingsStore: @unchecked Sendable {
                 defaults.set(settings.asrModel, forKey: "minddock.asr.model")
                 defaults.set(settings.speechLocale.rawValue, forKey: "minddock.speech.locale")
                 defaults.set(settings.feishuChatId, forKey: "minddock.feishu.chatId")
+                defaults.set(settings.feishuOpenId, forKey: "minddock.feishu.openId")
                 defaults.set(settings.feishuReceiveIdType, forKey: "minddock.feishu.receiveIdType")
                 defaults.set(settings.feishuBaseURL, forKey: "minddock.feishu.baseURL")
+                defaults.set(settings.onboardingCompleted, forKey: "minddock.onboarding.completed")
 
                 // Never leave plaintext secrets in UserDefaults plists.
                 defaults.removeObject(forKey: "minddock.llm.apiKey")
@@ -313,8 +402,10 @@ public final class MindDockSettingsStore: @unchecked Sendable {
         "MINDDOCK_FEISHU_APP_ID",
         "MINDDOCK_FEISHU_APP_SECRET",
         "MINDDOCK_FEISHU_CHAT_ID",
+        "MINDDOCK_FEISHU_OPEN_ID",
         "MINDDOCK_FEISHU_RECEIVE_ID_TYPE",
-        "MINDDOCK_FEISHU_BASE_URL"
+        "MINDDOCK_FEISHU_BASE_URL",
+        "MINDDOCK_ONBOARDING_COMPLETED"
     ]
 
     private func settingsFromDefaults() -> MindDockSettings {
@@ -351,11 +442,17 @@ public final class MindDockSettingsStore: @unchecked Sendable {
         if let v = MindDockSettings.nonEmptyOrNil(defaults.string(forKey: "minddock.feishu.chatId")) {
             s.feishuChatId = v
         }
+        if let v = MindDockSettings.nonEmptyOrNil(defaults.string(forKey: "minddock.feishu.openId")) {
+            s.feishuOpenId = v
+        }
         if let v = MindDockSettings.nonEmptyOrNil(defaults.string(forKey: "minddock.feishu.receiveIdType")) {
             s.feishuReceiveIdType = v
         }
         if let v = MindDockSettings.nonEmptyOrNil(defaults.string(forKey: "minddock.feishu.baseURL")) {
             s.feishuBaseURL = v
+        }
+        if defaults.object(forKey: "minddock.onboarding.completed") != nil {
+            s.onboardingCompleted = defaults.bool(forKey: "minddock.onboarding.completed")
         }
         return s
     }
@@ -392,11 +489,18 @@ public final class MindDockSettingsStore: @unchecked Sendable {
         if env["MINDDOCK_FEISHU_CHAT_ID"] != nil {
             settings.feishuChatId = env["MINDDOCK_FEISHU_CHAT_ID"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
+        if env["MINDDOCK_FEISHU_OPEN_ID"] != nil {
+            settings.feishuOpenId = env["MINDDOCK_FEISHU_OPEN_ID"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        }
         if let v = Self.firstNonEmpty(env["MINDDOCK_FEISHU_RECEIVE_ID_TYPE"]) {
             settings.feishuReceiveIdType = v
         }
         if let v = Self.firstNonEmpty(env["MINDDOCK_FEISHU_BASE_URL"]) {
             settings.feishuBaseURL = v
+        }
+        if let v = Self.firstNonEmpty(env["MINDDOCK_ONBOARDING_COMPLETED"]) {
+            let normalized = v.lowercased()
+            settings.onboardingCompleted = (normalized == "1" || normalized == "true" || normalized == "yes")
         }
     }
 
@@ -486,8 +590,10 @@ public final class MindDockSettingsStore: @unchecked Sendable {
             ("MINDDOCK_FEISHU_APP_ID", settings.feishuAppId),
             ("MINDDOCK_FEISHU_APP_SECRET", settings.feishuAppSecret),
             ("MINDDOCK_FEISHU_CHAT_ID", settings.feishuChatId),
+            ("MINDDOCK_FEISHU_OPEN_ID", settings.feishuOpenId),
             ("MINDDOCK_FEISHU_RECEIVE_ID_TYPE", settings.feishuReceiveIdType),
-            ("MINDDOCK_FEISHU_BASE_URL", settings.feishuBaseURL)
+            ("MINDDOCK_FEISHU_BASE_URL", settings.feishuBaseURL),
+            ("MINDDOCK_ONBOARDING_COMPLETED", settings.onboardingCompleted ? "1" : "0")
         ]
 
         var outLines = preservedLines

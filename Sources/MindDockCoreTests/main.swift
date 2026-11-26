@@ -2228,6 +2228,375 @@ let allTests: [TestCase] = [
             let zeroBatch = try await replayFeishu.pullMessages(sinceCursor: "0")
             try expectEqual(zeroBatch.messages.map(\.text), ["从游标 0 确定性拉取的消息"])
         }
+    },
+    TestCase(name: "feishu_qr_registrar_executes_init_begin_poll_and_switches_domain_for_lark") {
+        try runAsyncTest {
+            final class PollCounter: @unchecked Sendable {
+                let lock = NSLock()
+                var pollCount = 0
+                var sleepIntervals: [TimeInterval] = []
+            }
+            let tracker = PollCounter()
+
+            let session = StubURLProtocol.makeSession { req in
+                let formBody = String(decoding: req.body, as: UTF8.self)
+                if formBody == "action=init" {
+                    try expectEqual(req.url.absoluteString, "https://accounts.feishu.cn/oauth/v1/app/registration")
+                    try expectEqual(req.method, "POST")
+                    try expectTrue(
+                        (req.header("Content-Type") ?? "").contains("application/x-www-form-urlencoded"),
+                        "registration init must use application/x-www-form-urlencoded"
+                    )
+                    let json = #"{"supported_auth_methods":["client_secret","private_key_jwt"]}"#
+                    return (200, ["Content-Type": "application/json"], Data(json.utf8))
+                }
+                if formBody.contains("action=begin") {
+                    try expectEqual(req.url.absoluteString, "https://accounts.feishu.cn/oauth/v1/app/registration")
+                    try expectTrue(formBody.contains("archetype=PersonalAgent"), "must request PersonalAgent archetype")
+                    try expectTrue(formBody.contains("auth_method=client_secret"), "must request client_secret auth_method")
+                    try expectTrue(formBody.contains("request_user_info=open_id"), "must request open_id user_info")
+                    let json = """
+                    {
+                      "device_code": "v1:dev_qr_123",
+                      "user_code": "ABCD-EFGH",
+                      "verification_uri": "https://open.feishu.cn/page/launcher",
+                      "verification_uri_complete": "https://open.feishu.cn/page/launcher?user_code=ABCD-EFGH",
+                      "expires_in": 600,
+                      "interval": 3
+                    }
+                    """
+                    return (200, ["Content-Type": "application/json"], Data(json.utf8))
+                }
+                if formBody.contains("action=poll") {
+                    try expectTrue(formBody.contains("device_code=v1%3Adev_qr_123") || formBody.contains("device_code=v1:dev_qr_123"), "must pass device_code")
+                    try expectTrue(formBody.contains("tp=ob_cli_app"), "must pass tp=ob_cli_app")
+                    let step = tracker.lock.withLock { () -> Int in
+                        tracker.pollCount += 1
+                        return tracker.pollCount
+                    }
+                    switch step {
+                    case 1:
+                        try expectEqual(req.url.host, "accounts.feishu.cn", "First poll starts on accounts.feishu.cn")
+                        let json = #"{"error":"authorization_pending"}"#
+                        return (200, ["Content-Type": "application/json"], Data(json.utf8))
+                    case 2:
+                        try expectEqual(req.url.host, "accounts.feishu.cn")
+                        let json = #"{"error":"slow_down","user_info":{"tenant_brand":"lark"}}"#
+                        return (400, ["Content-Type": "application/json"], Data(json.utf8))
+                    default:
+                        try expectEqual(req.url.host, "accounts.larksuite.com", "Subsequent poll must switch to accounts.larksuite.com when tenant_brand == lark")
+                        let json = """
+                        {
+                          "client_id": "cli_qr_provisioned_99",
+                          "client_secret": "sec_qr_provisioned_88",
+                          "user_info": {
+                            "open_id": "ou_qr_owner_77",
+                            "tenant_brand": "lark"
+                          }
+                        }
+                        """
+                        return (200, ["Content-Type": "application/json"], Data(json.utf8))
+                    }
+                }
+                return (404, [:], Data())
+            }
+
+            let registrar = FeishuQRBotRegistrar(
+                session: session,
+                sleep: { seconds in
+                    tracker.lock.withLock { tracker.sleepIntervals.append(seconds) }
+                }
+            )
+
+            let deviceSession = try await registrar.beginRegistration()
+            try expectEqual(deviceSession.deviceCode, "v1:dev_qr_123")
+            try expectEqual(deviceSession.userCode, "ABCD-EFGH")
+            try expectEqual(deviceSession.interval, 3)
+            let completeURL = deviceSession.verificationURIComplete.absoluteString
+            try expectTrue(completeURL.contains("user_code=ABCD-EFGH"), "verificationURIComplete must preserve user_code")
+            try expectTrue(completeURL.contains("from=oc_onboard"), "verificationURIComplete must append from=oc_onboard")
+            try expectTrue(completeURL.contains("tp=ob_cli_app"), "verificationURIComplete must append tp=ob_cli_app")
+
+            let provisioned = try await registrar.awaitProvisioning(for: deviceSession)
+            try expectEqual(provisioned.appId, "cli_qr_provisioned_99")
+            try expectEqual(provisioned.appSecret, "sec_qr_provisioned_88")
+            try expectEqual(provisioned.openId, "ou_qr_owner_77")
+            try expectEqual(provisioned.domain, .lark)
+            try expectEqual(provisioned.domain.openAPIBaseURL.absoluteString, "https://open.larksuite.com")
+            try expectEqual(tracker.sleepIntervals, [3, 3, 8], "slow_down must increase polling interval by 5s")
+
+            // Verify expired_token and access_denied surface clean typed errors
+            let expiredSession = StubURLProtocol.makeSession { _ in
+                (400, ["Content-Type": "application/json"], Data(#"{"error":"expired_token","error_description":"device code expired"}"#.utf8))
+            }
+            let expiredRegistrar = FeishuQRBotRegistrar(session: expiredSession, sleep: { _ in })
+            var caughtExpired = false
+            do {
+                _ = try await expiredRegistrar.pollOnce(deviceCode: "v1:exp", domain: .feishu)
+            } catch FeishuQRRegistrationError.expiredToken {
+                caughtExpired = true
+            }
+            try expectTrue(caughtExpired, "expired_token must throw FeishuQRRegistrationError.expiredToken")
+        }
+    },
+    TestCase(name: "feishu_welcome_bootstrap_discovers_chat_id_falls_back_to_open_id_and_persists_onboarding_settings") {
+        // 1. Backward-compatible JSON decode + onboardingCompleted & feishuOpenId persistence
+        let tempDir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("MindDockOnboardingSettings-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+
+        let legacyJSON = #"{"llmBaseURL":"https://api.deepseek.com/v1","llmModel":"deepseek-chat"}"#
+        let decodedLegacy = try JSONDecoder().decode(MindDockSettings.self, from: Data(legacyJSON.utf8))
+        try expectEqual(decodedLegacy.feishuOpenId, "")
+        try expectEqual(decodedLegacy.onboardingCompleted, false)
+        try expectEqual(decodedLegacy.shouldAutoPresentOnboarding, true)
+
+        let configJSON = tempDir.appendingPathComponent("config.json")
+        let dotEnv = tempDir.appendingPathComponent(".env")
+        let store = MindDockSettingsStore(
+            configJSONURL: configJSON,
+            primaryDotEnvURL: dotEnv,
+            environment: [:],
+            defaults: nil
+        )
+
+        var skippedSettings = MindDockSettings()
+        skippedSettings.onboardingCompleted = true
+        skippedSettings.feishuOpenId = "ou_saved_owner_01"
+        try store.save(skippedSettings)
+
+        let reloaded = store.load()
+        try expectEqual(reloaded.onboardingCompleted, true)
+        try expectEqual(reloaded.feishuOpenId, "ou_saved_owner_01")
+        try expectEqual(reloaded.shouldAutoPresentOnboarding, false, "Completed onboarding must not auto-pop wizard again")
+        let dotEnvRaw = try String(contentsOf: dotEnv, encoding: .utf8)
+        try expectTrue(dotEnvRaw.contains("MINDDOCK_FEISHU_OPEN_ID='ou_saved_owner_01'"), ".env must persist MINDDOCK_FEISHU_OPEN_ID")
+
+        // 2. Welcome card bootstrap: direct openId + nil openId fallback to /open-apis/application/v6/applications/{appId}
+        try runAsyncTest {
+            let bootstrapSession = StubURLProtocol.makeSession { req in
+                if req.url.path == "/open-apis/auth/v3/tenant_access_token/internal" {
+                    return (200, ["Content-Type": "application/json"], Data(#"{"code":0,"tenant_access_token":"t-qr-boot","expire":7200}"#.utf8))
+                }
+                if req.url.path == "/open-apis/application/v6/applications/cli_qr_app" && req.method == "GET" {
+                    try expectEqual(req.url.query, "user_id_type=open_id")
+                    let appJSON = """
+                    {
+                      "code": 0,
+                      "data": {
+                        "app": {
+                          "app_id": "cli_qr_app",
+                          "creator_id": "ou_fallback_creator_42"
+                        }
+                      }
+                    }
+                    """
+                    return (200, ["Content-Type": "application/json"], Data(appJSON.utf8))
+                }
+                if req.url.path == "/open-apis/im/v1/messages" && req.method == "POST" {
+                    try expectEqual(req.url.query, "receive_id_type=open_id")
+                    let bodyObj = try expectUnwrap(
+                        try JSONSerialization.jsonObject(with: req.body) as? [String: Any],
+                        "welcome POST body must be JSON"
+                    )
+                    try expectEqual(bodyObj["receive_id"] as? String, "ou_fallback_creator_42")
+                    try expectEqual(bodyObj["msg_type"] as? String, "interactive")
+                    let resp = #"{"code":0,"msg":"success","data":{"message_id":"om_welcome_1","chat_id":"oc_auto_discovered_888"}}"#
+                    return (200, ["Content-Type": "application/json"], Data(resp.utf8))
+                }
+                return (404, [:], Data())
+            }
+
+            let bootClient = FeishuMobileBridgeClient(
+                config: MobileBridgeConfig(appId: "cli_qr_app", appSecret: "sec_qr_app"),
+                session: bootstrapSession
+            )
+            let bootstrapResult = try await bootClient.bootstrapBotWelcomeAndDiscoverChatId(openId: nil)
+            try expectEqual(bootstrapResult.openId, "ou_fallback_creator_42")
+            try expectEqual(bootstrapResult.chatId, "oc_auto_discovered_888")
+
+            // 3. Outbound push fallback to receive_id_type=open_id when chatId is empty and im/v1/chats returns no chats
+            let fallbackPushSession = StubURLProtocol.makeSession { req in
+                if req.url.path == "/open-apis/auth/v3/tenant_access_token/internal" {
+                    return (200, ["Content-Type": "application/json"], Data(#"{"code":0,"tenant_access_token":"t-openid-fallback","expire":7200}"#.utf8))
+                }
+                if req.url.path == "/open-apis/im/v1/chats" && req.method == "GET" {
+                    return (200, ["Content-Type": "application/json"], Data(#"{"code":0,"data":{"items":[]}}"#.utf8))
+                }
+                if req.url.path == "/open-apis/im/v1/messages" && req.method == "POST" {
+                    try expectEqual(req.url.query, "receive_id_type=open_id")
+                    let bodyObj = try expectUnwrap(
+                        try JSONSerialization.jsonObject(with: req.body) as? [String: Any],
+                        "fallback push body must be JSON"
+                    )
+                    try expectEqual(bodyObj["receive_id"] as? String, "ou_saved_owner_01")
+                    let resp = #"{"code":0,"data":{"message_id":"om_push_openid_1","chat_id":"oc_from_push_999"}}"#
+                    return (200, ["Content-Type": "application/json"], Data(resp.utf8))
+                }
+                return (404, [:], Data())
+            }
+
+            let settingsWithOpenIdOnly = MindDockSettings(
+                feishuAppId: "cli_openid_only",
+                feishuAppSecret: "sec_openid_only",
+                feishuChatId: "",
+                feishuOpenId: "ou_saved_owner_01"
+            )
+            let cfg = try expectUnwrap(settingsWithOpenIdOnly.mobileBridgeConfig, "App credentials must produce mobileBridgeConfig")
+            let fallbackClient = FeishuMobileBridgeClient(config: cfg, session: fallbackPushSession)
+            try await fallbackClient.pushLifeDock(
+                LifeDockPushPayload(
+                    berths: [LifeDockPushBerth(slotNumber: 1, id: "b1", raw: "下班买鲜花", prep: nil)],
+                    queuedCount: 0,
+                    fingerprint: "fp-openid-1"
+                )
+            )
+        }
+    },
+    TestCase(name: "end_to_end_feishu_qr_provisioning_binds_settings_sends_welcome_card_and_enables_zero_typing_sync") {
+        try runAsyncTest {
+            try await withTempDatabasePathAsync { dbPath in
+                final class FlowState: @unchecked Sendable {
+                    let lock = NSLock()
+                    var pollAttempt = 0
+                    var sentMessages: [(receiveIdType: String, receiveId: String, content: String)] = []
+                }
+                let state = FlowState()
+
+                let session = StubURLProtocol.makeSession { req in
+                    let formBody = String(decoding: req.body, as: UTF8.self)
+                    if req.url.path == "/oauth/v1/app/registration" {
+                        if formBody == "action=init" {
+                            return (200, ["Content-Type": "application/json"], Data(#"{"supported_auth_methods":["client_secret"]}"#.utf8))
+                        }
+                        if formBody.contains("action=begin") {
+                            let beginJSON = """
+                            {
+                              "device_code": "v1:e2e_qr_device",
+                              "user_code": "SCAN-0001",
+                              "verification_uri": "https://open.feishu.cn/page/launcher",
+                              "verification_uri_complete": "https://open.feishu.cn/page/launcher?user_code=SCAN-0001",
+                              "expires_in": 900,
+                              "interval": 2
+                            }
+                            """
+                            return (200, ["Content-Type": "application/json"], Data(beginJSON.utf8))
+                        }
+                        if formBody.contains("action=poll") {
+                            let n = state.lock.withLock { () -> Int in
+                                state.pollAttempt += 1
+                                return state.pollAttempt
+                            }
+                            if n == 1 {
+                                return (200, ["Content-Type": "application/json"], Data(#"{"error":"authorization_pending"}"#.utf8))
+                            }
+                            let doneJSON = """
+                            {
+                              "client_id": "cli_e2e_qr_bot",
+                              "client_secret": "sec_e2e_qr_bot",
+                              "user_info": {
+                                "open_id": "ou_e2e_phone_user",
+                                "tenant_brand": "feishu"
+                              }
+                            }
+                            """
+                            return (200, ["Content-Type": "application/json"], Data(doneJSON.utf8))
+                        }
+                    }
+                    if req.url.path == "/open-apis/auth/v3/tenant_access_token/internal" {
+                        return (200, ["Content-Type": "application/json"], Data(#"{"code":0,"tenant_access_token":"t-e2e-qr","expire":7200}"#.utf8))
+                    }
+                    if req.url.path == "/open-apis/im/v1/messages" && req.method == "POST" {
+                        let q = URLComponents(url: req.url, resolvingAgainstBaseURL: false)?.queryItems
+                        let ridType = q?.first(where: { $0.name == "receive_id_type" })?.value ?? ""
+                        let obj = (try? JSONSerialization.jsonObject(with: req.body)) as? [String: Any]
+                        let rid = (obj?["receive_id"] as? String) ?? ""
+                        let content = (obj?["content"] as? String) ?? ""
+                        state.lock.withLock {
+                            state.sentMessages.append((ridType, rid, content))
+                        }
+                        return (200, ["Content-Type": "application/json"], Data(#"{"code":0,"data":{"message_id":"om_qr_msg","chat_id":"oc_qr_bound_chat"}}"#.utf8))
+                    }
+                    return (404, [:], Data())
+                }
+
+                let registrar = FeishuQRBotRegistrar(session: session, sleep: { _ in })
+                let initialSettings = MindDockSettings()
+                try expectEqual(initialSettings.shouldAutoPresentOnboarding, true)
+
+                let qrSession = try await registrar.beginRegistration()
+                let bot = try await registrar.awaitProvisioning(for: qrSession)
+                let completion = try await registrar.completeProvisioning(bot, baseSettings: initialSettings)
+                let settings = completion.settings
+                let bootstrap = completion.bootstrap
+
+                try expectEqual(bootstrap.openId, "ou_e2e_phone_user")
+                try expectEqual(bootstrap.chatId, "oc_qr_bound_chat")
+                try expectEqual(settings.feishuAppId, "cli_e2e_qr_bot")
+                try expectEqual(settings.feishuAppSecret, "sec_e2e_qr_bot")
+                try expectEqual(settings.feishuOpenId, "ou_e2e_phone_user")
+                try expectEqual(settings.feishuChatId, "oc_qr_bound_chat")
+                try expectEqual(settings.feishuBaseURL, "https://open.feishu.cn")
+                try expectEqual(settings.onboardingCompleted, true)
+                try expectEqual(settings.shouldAutoPresentOnboarding, false)
+
+                // Hot-reload directly into DockEngine and push Life Berth using auto-discovered chat_id!
+                let engine = try DockEngine(databasePath: dbPath)
+                let adapters = MindDockRuntimeAdapters.make(from: settings, urlSession: session)
+                engine.applyAdapters(adapters)
+                let item = try engine.drop("下班给家里买草莓", lane: .life)
+                _ = try await engine.awaitPrep(id: item.id)
+                let shiftResult = try await engine.shiftAndSync(to: .life)
+                try expectEqual(shiftResult.pushedLifeDock, true)
+
+                let sent = state.lock.withLock { state.sentMessages }
+                try expectEqual(sent.count, 2, "Expected 1 welcome card (open_id) + 1 Life Dock push (chat_id)")
+                try expectEqual(sent[0].receiveIdType, "open_id")
+                try expectEqual(sent[0].receiveId, "ou_e2e_phone_user")
+                try expectEqual(sent[1].receiveIdType, "chat_id")
+                try expectEqual(sent[1].receiveId, "oc_qr_bound_chat")
+                try expectTrue(sent[1].content.contains("下班给家里买草莓"), "Life Dock push must contain Berth raw text")
+            }
+        }
+    },
+    TestCase(name: "llm_provider_presets_and_manual_feishu_scopes_json_match_spec") {
+        try expectEqual(LLMProviderPreset.deepseek.baseURL, "https://api.deepseek.com/v1")
+        try expectEqual(LLMProviderPreset.deepseek.defaultModel, "deepseek-chat")
+        try expectEqual(LLMProviderPreset.deepseek.apiKeyConsoleURL.absoluteString, "https://platform.deepseek.com/api_keys")
+
+        try expectEqual(LLMProviderPreset.qwen.baseURL, "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        try expectEqual(LLMProviderPreset.qwen.defaultModel, "qwen-plus")
+        try expectEqual(LLMProviderPreset.qwen.apiKeyConsoleURL.absoluteString, "https://bailian.console.aliyun.com/?apiKey=1")
+
+        try expectEqual(LLMProviderPreset.siliconFlow.baseURL, "https://api.siliconflow.cn/v1")
+        try expectEqual(LLMProviderPreset.siliconFlow.defaultModel, "deepseek-ai/DeepSeek-V3")
+        try expectEqual(LLMProviderPreset.siliconFlow.apiKeyConsoleURL.absoluteString, "https://cloud.siliconflow.cn/account/ak")
+
+        try expectEqual(LLMProviderPreset.openAI.baseURL, "https://api.openai.com/v1")
+        try expectEqual(LLMProviderPreset.openAI.defaultModel, "gpt-4o-mini")
+        try expectEqual(LLMProviderPreset.openAI.apiKeyConsoleURL.absoluteString, "https://platform.openai.com/api-keys")
+
+        try expectEqual(LLMProviderPreset.matching(baseURL: "https://dashscope.aliyuncs.com/compatible-mode/v1"), .qwen)
+        try expectEqual(LLMProviderPreset.matching(baseURL: "https://api.siliconflow.cn/v1"), .siliconFlow)
+        try expectEqual(Lane.work.dockTitle, "工作停靠台")
+        try expectEqual(Lane.life.dockTitle, "生活停靠台")
+
+        let scopesData = Data(FeishuQRBotRegistrar.manualPermissionScopesJSON.utf8)
+        let scopesRoot = try expectUnwrap(
+            try JSONSerialization.jsonObject(with: scopesData) as? [String: Any],
+            "manualPermissionScopesJSON must be valid JSON"
+        )
+        let scopesObj = try expectUnwrap(scopesRoot["scopes"] as? [String: Any], "must contain scopes object")
+        let tenantScopes = try expectUnwrap(scopesObj["tenant"] as? [String], "must contain tenant scopes array")
+        try expectEqual(Set(tenantScopes), Set([
+            "im:message",
+            "im:message:send_as_bot",
+            "im:message.group_msg",
+            "im:message.p2p_msg:readonly",
+            "im:chat:readonly",
+            "im:resource"
+        ]))
     }
 ]
 

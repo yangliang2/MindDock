@@ -30,11 +30,11 @@ public enum IntelligenceConnectionError: Error, LocalizedError, Sendable, Equata
     public var errorDescription: String? {
         switch self {
         case .missingAPIKey:
-            return "API Key is empty. Enter an OpenAI-compatible API Key first."
+            return "尚未填写 API Key，请先粘贴密钥后再验证。"
         case .httpStatus(let status, let detail):
             return detail.isEmpty ? "HTTP \(status)" : "HTTP \(status): \(detail)"
         case .emptyResponse:
-            return "Endpoint returned an empty completion response."
+            return "AI 接口返回了空响应，请检查模型名称是否正确。"
         }
     }
 }
@@ -122,7 +122,7 @@ public final class OpenAICompatibleIntelligenceClient: IntelligenceClient, @unch
             .replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let preview = String(cleaned.prefix(40))
-        return "Connected (\(configuration.model)): \(preview)"
+        return "已连通 (\(configuration.model))：\(preview)"
     }
 
     public func prepareDrop(raw: String, explicitLane: Lane?) async -> DropPrepAnalysis {

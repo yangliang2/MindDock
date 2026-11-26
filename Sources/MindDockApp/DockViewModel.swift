@@ -10,9 +10,9 @@ enum DropLaneChoice: String, CaseIterable, Sendable {
 
     var label: String {
         switch self {
-        case .auto: return "Auto"
-        case .work: return "Work"
-        case .life: return "Life"
+        case .auto: return "自动分道"
+        case .work: return "工作"
+        case .life: return "生活"
         }
     }
 }
@@ -23,8 +23,8 @@ enum QuickBarMode: String, CaseIterable, Sendable {
 
     var label: String {
         switch self {
-        case .drop: return "Drop"
-        case .recall: return "Recall"
+        case .drop: return "闪投"
+        case .recall: return "打捞"
         }
     }
 }
@@ -99,7 +99,7 @@ final class DockViewModel: ObservableObject {
             snapshot = try engine.getDock()
             onStateChanged?()
         } catch {
-            statusBanner = "Storage error: \(error)"
+            statusBanner = "本地存储异常：\(error.localizedDescription)"
         }
     }
 
@@ -176,16 +176,16 @@ final class DockViewModel: ObservableObject {
             dropLaneChoice = .auto
             snapshot = try engine.getDock()
             if item.lane != snapshot.activeLane {
-                statusBanner = "Dropped to \(item.lane.rawValue.capitalized) off-stage · Prep running"
+                statusBanner = "已闪投至\(item.lane.displayTitle)后台 · AI 正在备料"
             } else if item.status == .queued {
-                statusBanner = "3 Berths full — queued off-stage (FIFO)"
+                statusBanner = "3 个泊位已满 · 已排入候补队列（先进先出）"
             } else {
-                statusBanner = "Docked in \(item.lane.rawValue.capitalized) Berth"
+                statusBanner = "已停靠至\(item.lane.dockTitle)"
             }
             onStateChanged?()
             return true
         } catch {
-            statusBanner = "Drop failed: \(error)"
+            statusBanner = "闪投失败：\(error.localizedDescription)"
             return false
         }
     }
@@ -203,7 +203,7 @@ final class DockViewModel: ObservableObject {
         do {
             recallResults = try await engine.recall(query: trimmed)
         } catch {
-            statusBanner = "Recall failed: \(error)"
+            statusBanner = "打捞失败：\(error.localizedDescription)"
             recallResults = []
         }
     }
@@ -215,14 +215,14 @@ final class DockViewModel: ObservableObject {
             recallResults.removeAll { $0.id == id }
             snapshot = try engine.getDock()
             if item.status == .docked {
-                statusBanner = "Resurfaced to \(item.lane.rawValue.capitalized) Berth"
+                statusBanner = "已捞回\(item.lane.dockTitle)泊位"
             } else {
-                statusBanner = "3 Berths full — resurfaced into \(item.lane.rawValue.capitalized) queue"
+                statusBanner = "3 个泊位已满 · 已捞回\(item.lane.displayTitle)候补队列"
             }
             onStateChanged?()
             return item
         } catch {
-            statusBanner = "Resurface failed: \(error)"
+            statusBanner = "捞回失败：\(error.localizedDescription)"
             return nil
         }
     }
@@ -230,7 +230,7 @@ final class DockViewModel: ObservableObject {
     func shift(to lane: Lane) {
         do {
             snapshot = try engine.shift(to: lane)
-            statusBanner = "Shifted Dock to \(lane.rawValue.capitalized)"
+            statusBanner = "已换场至\(lane.dockTitle)"
             onStateChanged?()
             let engineRef = self.engine
             Task { [weak self] in
@@ -240,21 +240,21 @@ final class DockViewModel: ObservableObject {
                         guard let self else { return }
                         self.snapshot = result.snapshot
                         if result.pushedLifeDock {
-                            self.statusBanner = "Shifted to Life · Pushed to mobile lock screen"
+                            self.statusBanner = "已换场至生活 · 锁屏卡片已推送到手机飞书"
                         } else if let report = result.syncReport,
                                   (!report.droppedItems.isEmpty || !report.resolvedItems.isEmpty) {
-                            self.statusBanner = "Synced \(report.droppedItems.count) mobile Drop(s), \(report.resolvedItems.count) resolved"
+                            self.statusBanner = "已同步手机飞书：新接入 \(report.droppedItems.count) 条闪投，办结 \(report.resolvedItems.count) 项"
                         }
                         self.onStateChanged?()
                     }
                 } catch {
                     await MainActor.run {
-                        self?.statusBanner = "Mobile bridge error: \(error)"
+                        self?.statusBanner = "手机飞书提示：\(error.localizedDescription)"
                     }
                 }
             }
         } catch {
-            statusBanner = "Shift failed: \(error)"
+            statusBanner = "换场失败：\(error.localizedDescription)"
         }
     }
 
@@ -275,7 +275,7 @@ final class DockViewModel: ObservableObject {
             hasASRFallbackEndpoint: adapters.intelligenceClient.hasAudioTranscriptionEndpoint,
             speechLocale: settings.speechLocale
         )
-        statusBanner = "Settings applied live"
+        statusBanner = "配置已保存并即时生效"
         onStateChanged?()
     }
 
@@ -286,9 +286,9 @@ final class DockViewModel: ObservableObject {
     func triggerTestMobilePush() async throws -> MobilePushTestResult {
         let result = try await engine.testMobilePush()
         if result.usedSamplePreview {
-            statusBanner = "Sent sample Life Dock preview to phone lock screen"
+            statusBanner = "已向手机飞书发送锁屏预览卡片"
         } else {
-            statusBanner = "Pushed \(result.pushedBerthCount) Life Berth(s) to phone lock screen"
+            statusBanner = "已推送 \(result.pushedBerthCount) 个生活泊位到手机锁屏"
         }
         onStateChanged?()
         return result
@@ -300,9 +300,9 @@ final class DockViewModel: ObservableObject {
             snapshot = updated
         }
         if !report.droppedItems.isEmpty || !report.resolvedItems.isEmpty {
-            statusBanner = "Synced \(report.droppedItems.count) mobile Drop(s), \(report.resolvedItems.count) resolved"
+            statusBanner = "已同步手机飞书：新增 \(report.droppedItems.count) 条闪投，办结 \(report.resolvedItems.count) 项"
         } else {
-            statusBanner = "Mobile bridge up to date"
+            statusBanner = "手机飞书已是最新状态"
         }
         onStateChanged?()
         return report
@@ -320,13 +320,13 @@ final class DockViewModel: ObservableObject {
                         self.snapshot = updated
                     }
                     if !report.droppedItems.isEmpty || !report.resolvedItems.isEmpty {
-                        self.statusBanner = "Synced \(report.droppedItems.count) mobile Drop(s), \(report.resolvedItems.count) resolved"
+                        self.statusBanner = "已同步手机飞书：新增 \(report.droppedItems.count) 条闪投，办结 \(report.resolvedItems.count) 项"
                     }
                     self.onStateChanged?()
                 }
             } catch {
                 if manual {
-                    self.statusBanner = "Mobile sync failed: \(error.localizedDescription)"
+                    self.statusBanner = "手机同步失败：\(error.localizedDescription)"
                 }
             }
         }
@@ -337,13 +337,13 @@ final class DockViewModel: ObservableObject {
             let result = try engine.resolveBerth(id: id)
             snapshot = try engine.getDock()
             if result.promotedItem != nil {
-                statusBanner = "Sunk to Deep · Promoted oldest queued item"
+                statusBanner = "✓ 已办结沉入深海 · 候补首项已自动递补"
             } else {
-                statusBanner = "Sunk to Deep · Berth freed"
+                statusBanner = "✓ 已办结沉入深海 · 泊位已留白"
             }
             onStateChanged?()
         } catch {
-            statusBanner = "Resolve failed: \(error)"
+            statusBanner = "办结失败：\(error.localizedDescription)"
         }
     }
 
@@ -351,11 +351,11 @@ final class DockViewModel: ObservableObject {
         do {
             let updated = try engine.reclassify(id: id, to: .flipLane)
             snapshot = try engine.getDock()
-            let placement = updated.status == .docked ? "Berth" : "queue"
-            statusBanner = "Moved to \(updated.lane.rawValue.capitalized) \(placement)"
+            let placement = updated.status == .docked ? "泊位" : "候补队列"
+            statusBanner = "已切到\(updated.lane.displayTitle)\(placement)"
             onStateChanged?()
         } catch {
-            statusBanner = "Flip failed: \(error)"
+            statusBanner = "切换分道失败：\(error.localizedDescription)"
         }
     }
 
@@ -363,10 +363,10 @@ final class DockViewModel: ObservableObject {
         do {
             _ = try engine.reclassify(id: id, to: .deep)
             snapshot = try engine.getDock()
-            statusBanner = "Sunk straight to Deep"
+            statusBanner = "已沉入深海留存"
             onStateChanged?()
         } catch {
-            statusBanner = "Sink failed: \(error)"
+            statusBanner = "沉底失败：\(error.localizedDescription)"
         }
     }
 

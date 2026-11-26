@@ -15,6 +15,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
     private var settingsViewModel: SettingsViewModel?
     private var edgeDockPanel: EdgeDockPanel?
     private var quickDropPanel: QuickDropPanel?
+    private var onboardingWindow: OnboardingWizardWindow?
     private var settingsWindow: SettingsWindow?
     private var shiftMonitor: SystemShiftMonitor?
     private let focusTrigger = FocusTriggerModel()
@@ -47,7 +48,11 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
             }
 
             showEdgeDock()
-            vm.syncMobileBridgeInBackground()
+            if initialSettings.shouldAutoPresentOnboarding {
+                showOnboardingWizard()
+            } else {
+                vm.syncMobileBridgeInBackground()
+            }
         } catch {
             fputs("Failed to launch MindDock: \(error)\n", stderr)
             NSApp.terminate(nil)
@@ -55,12 +60,22 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        settingsViewModel?.stopFeishuQRPolling()
         viewModel?.cancelQuickBarSession()
         shiftMonitor?.stop()
         HotKeyManager.shared.unregisterAll()
     }
 
     // MARK: - Setup
+
+    private func ensureSettingsViewModel(with vm: DockViewModel) -> SettingsViewModel {
+        if let existing = settingsViewModel {
+            return existing
+        }
+        let created = SettingsViewModel(store: settingsStore, dockViewModel: vm)
+        self.settingsViewModel = created
+        return created
+    }
 
     private func setupPanels(with vm: DockViewModel) {
         let edgeView = EdgeDockView(
@@ -96,7 +111,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
 
         let quickDropItem = NSMenuItem(
-            title: "Quick Drop… (⌥Space)",
+            title: "闪投… (⌥Space)",
             action: #selector(handleQuickDropMenu),
             keyEquivalent: ""
         )
@@ -104,7 +119,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quickDropItem)
 
         let recallItem = NSMenuItem(
-            title: "Recall from Deep…",
+            title: "从深海打捞…",
             action: #selector(handleRecallMenu),
             keyEquivalent: ""
         )
@@ -112,7 +127,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(recallItem)
 
         let toggleDockItem = NSMenuItem(
-            title: "Toggle Edge Dock (⌥⇧Space)",
+            title: "显示/隐藏停靠台 (⌥⇧Space)",
             action: #selector(handleToggleEdgeDockMenu),
             keyEquivalent: ""
         )
@@ -122,7 +137,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
 
         let shiftWorkItem = NSMenuItem(
-            title: "Shift to Work Dock",
+            title: "换场至工作停靠台",
             action: #selector(handleShiftWork),
             keyEquivalent: ""
         )
@@ -130,7 +145,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(shiftWorkItem)
 
         let shiftLifeItem = NSMenuItem(
-            title: "Shift to Life Dock",
+            title: "换场至生活停靠台",
             action: #selector(handleShiftLife),
             keyEquivalent: ""
         )
@@ -138,7 +153,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(shiftLifeItem)
 
         let syncMobileItem = NSMenuItem(
-            title: "Sync Mobile Drops Now",
+            title: "立即同步手机飞书",
             action: #selector(handleSyncMobileNow),
             keyEquivalent: ""
         )
@@ -146,7 +161,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(syncMobileItem)
 
         let testPushItem = NSMenuItem(
-            title: "Test Lock-Screen Push",
+            title: "发送锁屏推送测试",
             action: #selector(handleTestLockScreenPush),
             keyEquivalent: ""
         )
@@ -155,8 +170,16 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let wizardItem = NSMenuItem(
+            title: "新手配置向导…",
+            action: #selector(handleOpenOnboarding),
+            keyEquivalent: ""
+        )
+        wizardItem.target = self
+        menu.addItem(wizardItem)
+
         let settingsItem = NSMenuItem(
-            title: "Settings & Mobile Setup…",
+            title: "设置与手机连接…",
             action: #selector(handleOpenSettings),
             keyEquivalent: ","
         )
@@ -164,7 +187,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(settingsItem)
 
         let quitItem = NSMenuItem(
-            title: "Quit MindDock",
+            title: "退出 MindDock",
             action: #selector(handleQuit),
             keyEquivalent: "q"
         )
@@ -265,20 +288,52 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         self.previousExternalApp = nil
     }
 
+    func showOnboardingWizard() {
+        guard let vm = viewModel else { return }
+        settingsWindow?.close()
+        let settingsVM = ensureSettingsViewModel(with: vm)
+        settingsVM.prepareForOnboardingOpen()
+
+        if onboardingWindow == nil {
+            let rootView = OnboardingWizardView(
+                viewModel: settingsVM,
+                onFinish: { [weak self] in
+                    self?.onboardingWindow?.close()
+                    self?.showEdgeDock()
+                }
+            )
+            let win = OnboardingWizardWindow(rootView: rootView)
+            win.onWindowWillClose = { [weak settingsVM] in
+                settingsVM?.stopFeishuQRPolling()
+            }
+            self.onboardingWindow = win
+        }
+        NSApp.activate()
+        onboardingWindow?.makeKeyAndOrderFront(nil)
+    }
+
     func showSettingsWindow() {
         guard let vm = viewModel else { return }
+        onboardingWindow?.close()
+        let settingsVM = ensureSettingsViewModel(with: vm)
+        settingsVM.draft = settingsStore.load()
+        settingsVM.selectedPreset = LLMProviderPreset.matching(baseURL: settingsVM.draft.llmBaseURL) ?? .deepseek
+
         if settingsWindow == nil {
-            let settingsVM = SettingsViewModel(store: settingsStore, dockViewModel: vm)
-            self.settingsViewModel = settingsVM
             let rootView = SettingsView(
                 viewModel: settingsVM,
+                onOpenOnboarding: { [weak self] in
+                    self?.showOnboardingWizard()
+                },
                 onClose: { [weak self] in
                     self?.settingsWindow?.close()
                 }
             )
-            self.settingsWindow = SettingsWindow(rootView: rootView)
-        } else {
-            settingsViewModel?.draft = settingsStore.load()
+            let win = SettingsWindow(rootView: rootView)
+            win.onWindowWillClose = { [weak settingsVM] in
+                settingsVM?.stopFeishuQRPolling()
+            }
+            self.settingsWindow = win
         }
         NSApp.activate()
         settingsWindow?.makeKeyAndOrderFront(nil)
@@ -289,8 +344,16 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
 
         let appMenuItem = NSMenuItem()
         let appMenu = NSMenu()
+        let wizardItem = NSMenuItem(
+            title: "新手配置向导…",
+            action: #selector(handleOpenOnboarding),
+            keyEquivalent: ""
+        )
+        wizardItem.target = self
+        appMenu.addItem(wizardItem)
+
         let settingsItem = NSMenuItem(
-            title: "Settings & Mobile Setup…",
+            title: "设置与手机连接…",
             action: #selector(handleOpenSettings),
             keyEquivalent: ","
         )
@@ -298,7 +361,7 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
         appMenu.addItem(settingsItem)
         appMenu.addItem(.separator())
         let quitItem = NSMenuItem(
-            title: "Quit MindDock",
+            title: "退出 MindDock",
             action: #selector(handleQuit),
             keyEquivalent: "q"
         )
@@ -309,20 +372,20 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
 
         // Standard Edit menu enables ⌘V / ⌘C / ⌘X / ⌘A / ⌘Z inside accessory-app TextFields & SecureFields
         let editMenuItem = NSMenuItem()
-        let editMenu = NSMenu(title: "Edit")
-        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
-        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
         editMenu.addItem(.separator())
-        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenuItem.submenu = editMenu
         mainMenu.addItem(editMenuItem)
 
         let windowMenuItem = NSMenuItem()
-        let windowMenu = NSMenu(title: "Window")
-        windowMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        let windowMenu = NSMenu(title: "窗口")
+        windowMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         windowMenuItem.submenu = windowMenu
         mainMenu.addItem(windowMenuItem)
 
@@ -364,10 +427,14 @@ final class MindDockAppDelegate: NSObject, NSApplicationDelegate {
                 _ = try await vm.triggerTestMobilePush()
                 self.showEdgeDock()
             } catch {
-                vm.statusBanner = "Test push failed: \(error.localizedDescription)"
+                vm.statusBanner = "锁屏推送测试失败：\(error.localizedDescription)"
                 self.showSettingsWindow()
             }
         }
+    }
+
+    @objc private func handleOpenOnboarding() {
+        showOnboardingWizard()
     }
 
     @objc private func handleOpenSettings() {

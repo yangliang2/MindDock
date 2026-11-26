@@ -7,6 +7,20 @@ public enum Lane: String, Codable, CaseIterable, Sendable, Equatable {
     public var opposite: Lane {
         self == .work ? .life : .work
     }
+
+    public var displayTitle: String {
+        switch self {
+        case .work: return "工作"
+        case .life: return "生活"
+        }
+    }
+
+    public var dockTitle: String {
+        switch self {
+        case .work: return "工作停靠台"
+        case .life: return "生活停靠台"
+        }
+    }
 }
 
 public enum ItemStatus: String, Codable, Sendable, Equatable {

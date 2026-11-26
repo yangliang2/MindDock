@@ -37,7 +37,7 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
+    <string>zh_CN</string>
     <key>CFBundleDisplayName</key>
     <string>MindDock</string>
     <key>CFBundleExecutable</key>
@@ -61,9 +61,9 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>MindDock uses the microphone strictly on demand when you trigger a spoken Drop, releasing audio hardware immediately after capture.</string>
+    <string>MindDock 仅在你主动点击或按住麦克风进行语音闪投时按需录音，松手立即释放音频硬件（平时零后台占用）。</string>
     <key>NSSpeechRecognitionUsageDescription</key>
-    <string>MindDock uses macOS Speech Recognition on demand to transcribe spoken Drops and off-desk voice messages.</string>
+    <string>MindDock 使用 macOS 本地语音识别服务按需将你的语音闪投与飞书语音消息转写为文字。</string>
 </dict>
 </plist>
 PLIST

@@ -53,19 +53,19 @@ public final class NativeSpeechCaptureDriver: VoiceCaptureSessionDriver, @unchec
 
         let micGranted = await Self.requestMicrophonePermission()
         guard micGranted else {
-            throw VoiceCaptureError.permissionDenied("Microphone access not granted")
+            throw VoiceCaptureError.permissionDenied("未获得麦克风权限，请在「系统设置 → 隐私与安全性 → 麦克风」中允许 MindDock")
         }
 
         let speechAuthorized = await Self.requestSpeechAuthorization()
         guard speechAuthorized || recordFallbackFile else {
-            throw VoiceCaptureError.permissionDenied("Speech recognition permission not granted")
+            throw VoiceCaptureError.permissionDenied("未获得语音识别权限，请在「系统设置 → 隐私与安全性 → 语音识别」中允许 MindDock")
         }
 
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
         let recordingFormat = inputNode.outputFormat(forBus: 0)
         guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
-            throw VoiceCaptureError.hardwareUnavailable("No active audio input device")
+            throw VoiceCaptureError.hardwareUnavailable("未检测到可用的麦克风输入设备")
         }
 
         var request: SFSpeechAudioBufferRecognitionRequest?
@@ -304,7 +304,7 @@ public final class VoiceCaptureController: ObservableObject {
         self.latestSessionTranscript = ""
         self.onTextUpdated = onTextUpdated
         self.isRecording = true
-        self.voiceStatusMessage = "Listening (\(speechLocale.shortLabel))…"
+        self.voiceStatusMessage = "正在倾听（\(speechLocale.shortLabel)）…"
 
         captureGeneration &+= 1
         let generation = captureGeneration
@@ -339,7 +339,7 @@ public final class VoiceCaptureController: ObservableObject {
                         Task { @MainActor [weak self] in
                             guard let self, self.isRecording, self.captureGeneration == generation else { return }
                             if self.latestSessionTranscript.isEmpty {
-                                self.voiceStatusMessage = "Voice stopped: \(message)"
+                                self.voiceStatusMessage = "语音已结束：\(message)"
                             }
                             self.stopCapture(finalizeWithASRIfNeeded: true)
                         }
@@ -378,7 +378,7 @@ public final class VoiceCaptureController: ObservableObject {
             && hasASRFallbackEndpoint
 
         if needsASRFallback, let recordedURL, let client = intelligenceClient {
-            voiceStatusMessage = "Transcribing audio…"
+            voiceStatusMessage = "正在转写语音…"
             let prefix = basePrefix
             let callback = onTextUpdated
             pendingASRTask = Task { @MainActor [weak self] in

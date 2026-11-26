@@ -124,6 +124,16 @@ public struct MobilePushTestResult: Sendable, Equatable {
     }
 }
 
+public struct FeishuWelcomeBootstrapResult: Codable, Sendable, Equatable {
+    public let openId: String
+    public let chatId: String
+
+    public init(openId: String, chatId: String) {
+        self.openId = openId
+        self.chatId = chatId
+    }
+}
+
 public enum MobileBridgeError: Error, LocalizedError, Sendable, Equatable {
     case unconfigured
     case invalidResponse(String)
@@ -134,16 +144,16 @@ public enum MobileBridgeError: Error, LocalizedError, Sendable, Equatable {
     public var errorDescription: String? {
         switch self {
         case .unconfigured:
-            return "Mobile bridge is not configured yet. Enter a Feishu App ID + Secret (with Chat ID) or a Webhook URL."
+            return "尚未连接手机飞书。请打开「新手配置向导」扫码一键接入，或填写单人群 Webhook。"
         case .invalidResponse(let detail):
-            return "Invalid response from mobile bridge: \(detail)"
+            return "飞书连接返回异常：\(detail)"
         case .httpStatus(let status, let body):
             let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? "HTTP \(status)" : "HTTP \(status): \(String(trimmed.prefix(200)))"
         case .remoteError(let code, let msg):
-            return "Remote error (\(code)): \(msg)"
+            return "飞书接口错误 (\(code))：\(msg)"
         case .transcriptionFailed(let msg):
-            return "Audio transcription failed: \(msg)"
+            return "语音转写失败：\(msg)"
         }
     }
 }
@@ -153,6 +163,7 @@ public struct MobileBridgeConfig: Codable, Sendable, Equatable {
     public var appId: String?
     public var appSecret: String?
     public var chatId: String?
+    public var openId: String?
     public var receiveIdType: String
     public var apiBaseURL: URL
 
@@ -161,6 +172,7 @@ public struct MobileBridgeConfig: Codable, Sendable, Equatable {
         appId: String? = nil,
         appSecret: String? = nil,
         chatId: String? = nil,
+        openId: String? = nil,
         receiveIdType: String = "chat_id",
         apiBaseURL: URL = URL(string: "https://open.feishu.cn")!
     ) {
@@ -168,6 +180,7 @@ public struct MobileBridgeConfig: Codable, Sendable, Equatable {
         self.appId = appId
         self.appSecret = appSecret
         self.chatId = chatId
+        self.openId = openId
         self.receiveIdType = receiveIdType
         self.apiBaseURL = apiBaseURL
     }
@@ -211,13 +224,39 @@ public final class FeishuMobileBridgeClient: MobileBridgeClient, @unchecked Send
     public func pushLifeDock(_ payload: LifeDockPushPayload) async throws {
         if config.hasAppBotCredentials {
             let token = try await validTenantAccessToken()
-            if let receiveId = try await resolveTargetChatId(token: token) {
-                try await sendAppBotCard(payload: payload, receiveId: receiveId, token: token)
+            let fallbackOpenId = Self.nonEmptyString(config.openId)
+            let resolvedChatId: String?
+            if fallbackOpenId != nil {
+                resolvedChatId = try? await resolveTargetChatId(token: token)
+            } else {
+                resolvedChatId = try await resolveTargetChatId(token: token)
+            }
+
+            if let receiveId = resolvedChatId {
+                _ = try await sendAppBotCard(
+                    payload: payload,
+                    receiveId: receiveId,
+                    receiveIdType: config.receiveIdType,
+                    token: token
+                )
                 return
             }
+
+            if let fallbackOpenId {
+                if let discovered = try await sendAppBotCard(
+                    payload: payload,
+                    receiveId: fallbackOpenId,
+                    receiveIdType: "open_id",
+                    token: token
+                ) {
+                    lock.withLock { self.discoveredChatId = discovered }
+                }
+                return
+            }
+
             if config.webhookURL == nil {
                 throw MobileBridgeError.invalidResponse(
-                    "Feishu App credentials verified, but no bot chat found yet. Send 'hi' to your MindDock bot in Feishu (or fill in Chat ID)."
+                    "飞书机器人凭证已验证，但尚未找到聊天会话。请在手机飞书中给机器人发一句「你好」，或通过扫码自动绑定。"
                 )
             }
         }
@@ -228,6 +267,38 @@ public final class FeishuMobileBridgeClient: MobileBridgeClient, @unchecked Send
         }
 
         throw MobileBridgeError.unconfigured
+    }
+
+    @discardableResult
+    public func bootstrapBotWelcomeAndDiscoverChatId(openId: String? = nil) async throws -> FeishuWelcomeBootstrapResult {
+        guard config.hasAppBotCredentials else {
+            throw MobileBridgeError.unconfigured
+        }
+        let token = try await validTenantAccessToken()
+        let effectiveOpenId: String
+        if let direct = Self.nonEmptyString(openId) ?? Self.nonEmptyString(config.openId) {
+            effectiveOpenId = direct
+        } else {
+            effectiveOpenId = try await fetchCreatorOpenId(token: token)
+        }
+
+        let welcomeCard = Self.buildFeishuWelcomeCard()
+        if let chatId = try await sendInteractiveCard(
+            card: welcomeCard,
+            receiveId: effectiveOpenId,
+            receiveIdType: "open_id",
+            token: token
+        ) {
+            lock.withLock { self.discoveredChatId = chatId }
+            return FeishuWelcomeBootstrapResult(openId: effectiveOpenId, chatId: chatId)
+        }
+
+        if let fallbackChat = try? await resolveTargetChatId(token: token), !fallbackChat.isEmpty {
+            lock.withLock { self.discoveredChatId = fallbackChat }
+            return FeishuWelcomeBootstrapResult(openId: effectiveOpenId, chatId: fallbackChat)
+        }
+
+        throw MobileBridgeError.invalidResponse("欢迎卡片已发出，但响应中未包含 chat_id")
     }
 
     public func pullMessages(sinceCursor: String?) async throws -> InboundMessageBatch {
@@ -497,17 +568,61 @@ public final class FeishuMobileBridgeClient: MobileBridgeClient, @unchecked Send
         try validateHTTPAndFeishuCode(data: data, response: http)
     }
 
-    private func sendAppBotCard(payload: LifeDockPushPayload, receiveId: String, token: String) async throws {
+    private static func buildFeishuWelcomeCard() -> [String: Any] {
+        [
+            "config": ["wide_screen_mode": true],
+            "header": [
+                "template": "green",
+                "title": [
+                    "tag": "plain_text",
+                    "content": "🎉 MindDock · 手机飞书已连接"
+                ]
+            ],
+            "elements": [
+                [
+                    "tag": "markdown",
+                    "content": """
+                    **无需配置服务器，双向接力已就绪：**
+                    • **离开工位时**：Mac 锁屏或合盖会自动把最多 3 个「生活泊位」推到手机锁屏
+                    • **在外随手闪投**：直接在这里发**文字或语音**，回电脑前自动上台并由 AI 备好下一步
+                    • **一行办结销项**：直接回复 `1`、`完成 1` 或 `done 1` 即可销项并递补候补事项
+                    """
+                ]
+            ]
+        ]
+    }
+
+    @discardableResult
+    private func sendAppBotCard(
+        payload: LifeDockPushPayload,
+        receiveId: String,
+        receiveIdType: String,
+        token: String
+    ) async throws -> String? {
+        let card = Self.buildFeishuInteractiveCard(for: payload)
+        return try await sendInteractiveCard(
+            card: card,
+            receiveId: receiveId,
+            receiveIdType: receiveIdType,
+            token: token
+        )
+    }
+
+    private func sendInteractiveCard(
+        card: [String: Any],
+        receiveId: String,
+        receiveIdType: String,
+        token: String
+    ) async throws -> String? {
         var comps = URLComponents(
             url: config.apiBaseURL.appendingPathComponent("/open-apis/im/v1/messages"),
             resolvingAgainstBaseURL: false
         )
-        comps?.queryItems = [URLQueryItem(name: "receive_id_type", value: config.receiveIdType)]
+        comps?.queryItems = [URLQueryItem(name: "receive_id_type", value: receiveIdType)]
         guard let url = comps?.url else {
             throw MobileBridgeError.invalidResponse("Unable to build Feishu messages URL")
         }
 
-        let card = Self.buildFeishuInteractiveCard(for: payload)
         let cardData = try JSONSerialization.data(withJSONObject: card)
         guard let cardString = String(data: cardData, encoding: .utf8) else {
             throw MobileBridgeError.invalidResponse("Unable to encode Feishu card content string")
@@ -527,6 +642,55 @@ public final class FeishuMobileBridgeClient: MobileBridgeClient, @unchecked Send
 
         let (data, http) = try await performDataRequest(req)
         try validateHTTPAndFeishuCode(data: data, response: http)
+
+        if let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let dataObj = root["data"] as? [String: Any],
+           let chatId = Self.nonEmptyString(dataObj["chat_id"]) {
+            return chatId
+        }
+        return nil
+    }
+
+    private func fetchCreatorOpenId(token: String) async throws -> String {
+        guard let appId = Self.nonEmptyString(config.appId) else {
+            throw MobileBridgeError.unconfigured
+        }
+        var comps = URLComponents(
+            url: config.apiBaseURL
+                .appendingPathComponent("/open-apis/application/v6/applications")
+                .appendingPathComponent(appId),
+            resolvingAgainstBaseURL: false
+        )
+        comps?.queryItems = [URLQueryItem(name: "user_id_type", value: "open_id")]
+        guard let url = comps?.url else {
+            throw MobileBridgeError.invalidResponse("Unable to build application info URL")
+        }
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+
+        let (data, http) = try await performDataRequest(req)
+        try validateHTTPAndFeishuCode(data: data, response: http)
+
+        if let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let dataObj = root["data"] as? [String: Any],
+           let appObj = dataObj["app"] as? [String: Any] {
+            if let creatorId = Self.nonEmptyString(appObj["creator_id"]) {
+                return creatorId
+            }
+            if let ownerObj = appObj["owner"] as? [String: Any],
+               let ownerId = Self.nonEmptyString(ownerObj["owner_id"]) {
+                return ownerId
+            }
+        }
+        throw MobileBridgeError.invalidResponse("未能从飞书应用详情中获取创建者 open_id")
+    }
+
+    private static func nonEmptyString(_ raw: Any?) -> String? {
+        guard let str = raw as? String else { return nil }
+        let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func validTenantAccessToken() async throws -> String {
